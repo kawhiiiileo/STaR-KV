@@ -131,10 +131,9 @@ For exact reproduction settings, see `examples/repro_ssp_kv.sh`.
 
 Reference ScreenSpot-Pro accuracy with `examples/repro_ssp_kv.sh`:
 
-| Retained KV | Overall | Text | Icon |
-| --- | ---: | ---: | ---: |
-| 10% | 37.57 | 52.10 | 14.07 |
-| 20% | 41.18 | 55.78 | 17.55 |
+| Budget | 10% | 20% |
+| --- | ---: | ---: |
+| Overall | 37.70 | 40.90 |
 
 Outputs are written to:
 
