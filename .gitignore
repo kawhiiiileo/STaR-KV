@@ -1,0 +1,32 @@
+# Optional local path overrides (create manually if needed)
+examples/starkv_local_paths.env
+examples/starkv_local_paths.local.sh
+# legacy locations (still honored if present)
+starkv_local_paths.env
+starkv_local_paths.local.sh
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+images/.DS_Store
+*.swp
+
+# Large artifacts (keep models/data outside the repo)
+*.safetensors
+*.bin
+*.pt
+*.pth
+results/
+logs/

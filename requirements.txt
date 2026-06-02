@@ -1,0 +1,25 @@
+# Core dependencies (GPU conda/venv recommended)
+# PyTorch: install cu124 wheels first if not present, e.g. torch==2.5.1 torchvision==0.20.1
+torch>=2.5.0
+torchvision>=0.20.0
+# REQUIRED separately (not on PyPI at this pin):
+#   pip install git+https://github.com/huggingface/transformers.git@bbca9782ca1b8b358cc832a1b821aa1b450850da
+accelerate>=1.8.0
+
+# Flash Attention
+flash-attn>=2.8.0
+
+# Vision and multimodal
+pillow>=11.0.0
+qwen-vl-utils>=0.0.8
+
+# Scientific computing
+numpy>=2.0.0
+scipy>=1.15.0
+
+# Utilities
+tqdm>=4.67.0
+pyyaml>=6.0.0
+
+# Optional: for vLLM inference backend
+# vllm>=0.9.0
