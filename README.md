@@ -1,14 +1,34 @@
-# STaR-KV
+<div align="center">
 
-Official implementation of **STaR-KV: Spatio-Temporal Adaptive Re-weighting for KV Cache Compression in GUI Vision-Language Models**.
+<h1> STaR-KV: Spatio-Temporal Adaptive Re-weighting for KV Cache Compression in GUI Vision-Language Models </h1>
 
-**Authors:** Yuhang Han, Wenzheng Yang, Yujie Chen, Xiangqi Jin, Yaojie Zhang, Siteng Huang, Linfeng Zhang
+Yuhang Han<sup>1,2*</sup>,
+Wenzheng Yang<sup>3*</sup>,
+Yujie Chen<sup>1,2</sup>,
+Xiangqi Jin<sup>1,2</sup>,  
+Yaojie Zhang<sup>1,4</sup>,
+Siteng Huang<sup>5</sup>,
+Linfeng Zhang<sup>1✉</sup>
 
-**Links:** [arXiv](https://arxiv.org/abs/2606.01790) | [PDF](https://arxiv.org/pdf/2606.01790) | [Code](https://github.com/kawhiiiileo/STaR-KV)
+<sup>1</sup> EPIC Lab, SJTU  
+<sup>2</sup> HKUST (GZ)  
+<sup>3</sup> The University of Sydney  
+<sup>4</sup> UESTC  
+<sup>5</sup> ZJU
 
-## Main Figure
+<sup>*</sup> Equal contribution. &nbsp;&nbsp; <sup>✉</sup> Corresponding author.
 
-![STaR-KV overview](images/main_fig.png)
+<h4>
+<a href="https://arxiv.org/abs/2606.01790"><img src="https://img.shields.io/badge/Paper-arXiv-red"></a>
+<a href="https://arxiv.org/pdf/2606.01790"><img src="https://img.shields.io/badge/PDF-arXiv-red"></a>
+<a href="https://github.com/kawhiiiileo/STaR-KV"><img src="https://img.shields.io/badge/Code-GitHub-blue"></a>
+</h4>
+
+</div>
+
+<p align="center">
+<img width="900" alt="STaR-KV overview" src="images/main_fig.png">
+</p>
 
 ## Overview
 
@@ -108,29 +128,7 @@ GPU=0 BUDGETS="10 20" bash examples/repro_ssp_kv.sh
 
 `BUDGET` / `BUDGETS` controls `--kv_cache_budget`, the retained KV-cache percentage. For example, `BUDGET=20` keeps about 20% of the full cache before appending the always-kept recent window.
 
-The script enables the full STaR-KV stack:
-
-```bash
---kv_cache starkv
---kv_group_soft_prior_lambda 0.5
---kv_group_online_profile_steps 5
---kv_group_online_profile_decay 0.9
---kv_group_online_profile_tau 1.0
---kv_group_online_profile_lambda_ramp_steps 10
---alpha 2
---temperature 3.5
---window_size 8
---kv_entropy_budget_enable
---kv_entropy_budget_min_scale 0.75
---kv_entropy_budget_max_scale 1.25
---kv_entropy_budget_smooth 0.0
---kv_group_temporal_enable
---kv_group_temporal_delta 0.1
---kv_group_temporal_rho 0.9
---kv_group_temporal_eps 0.0
---kv_group_temporal_discount_min 0.0
---kv_group_temporal_warmup_steps 0
-```
+For exact reproduction settings, see `examples/repro_ssp_kv.sh`.
 
 Reference ScreenSpot-Pro accuracy with `examples/repro_ssp_kv.sh`:
 
