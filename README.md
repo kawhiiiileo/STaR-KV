@@ -2,21 +2,20 @@
 
 <h1> STaR-KV: Spatio-Temporal Adaptive Re-weighting for KV Cache Compression in GUI Vision-Language Models </h1>
 
-Yuhang Han<sup>1,2*</sup>,
-Wenzheng Yang<sup>3*</sup>,
-Yujie Chen<sup>1,2</sup>,
-Xiangqi Jin<sup>1,2</sup>,  
-Yaojie Zhang<sup>1,4</sup>,
-Siteng Huang<sup>5</sup>,
-Linfeng Zhang<sup>1✉</sup>
+<p>
+Yuhang Han<sup>1,2*</sup>, Wenzheng Yang<sup>3*</sup>, Yujie Chen<sup>1,2</sup>, Xiangqi Jin<sup>1,2</sup>,<br>
+Yaojie Zhang<sup>1,4</sup>, Siteng Huang<sup>5</sup>, Linfeng Zhang<sup>1✉</sup>
+</p>
 
-<sup>1</sup> EPIC Lab, SJTU  
-<sup>2</sup> HKUST (GZ)  
-<sup>3</sup> The University of Sydney  
-<sup>4</sup> UESTC  
+<p>
+<sup>1</sup> EPIC Lab, SJTU &nbsp;&nbsp;
+<sup>2</sup> HKUST (GZ) &nbsp;&nbsp;
+<sup>3</sup> The University of Sydney<br>
+<sup>4</sup> UESTC &nbsp;&nbsp;
 <sup>5</sup> ZJU
+</p>
 
-<sup>*</sup> Equal contribution. &nbsp;&nbsp; <sup>✉</sup> Corresponding author.
+<p><sup>*</sup> Equal contribution. &nbsp;&nbsp; <sup>✉</sup> Corresponding author.</p>
 
 <h4>
 <a href="https://arxiv.org/abs/2606.01790"><img src="https://img.shields.io/badge/Paper-arXiv-red"></a>
