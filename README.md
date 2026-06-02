@@ -133,7 +133,7 @@ Reference ScreenSpot-Pro accuracy with `examples/repro_ssp_kv.sh`:
 
 | Budget | 10% | 20% |
 | --- | ---: | ---: |
-| Overall | 37.70 | 40.90 |
+| Overall | 37.7 | 40.9 |
 
 Outputs are written to:
 
