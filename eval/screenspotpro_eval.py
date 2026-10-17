@@ -18,27 +18,40 @@ from ui_tars_utils import (
     analyze_vision_tokens_multi_images
 )
 from attention_helpers import (
+    add_flash_attention_2_argument,
+    require_flash_attention_2,
     replace_qwen2_5_vl,
     replace_opencua,
     set_attention_implementation,
     configure_accelerate_skip_attention,
     set_kv_cache_budget,
     set_vision_start_idx,
+    apply_vision_analysis_to_model,
     set_vision_end_idx,
     set_alpha,
     set_window_size,
     set_move_attention_to_cpu,
     set_temperature,
-    apply_entropy_budget_runtime,
-    collect_entropy_budget_stats,
+    collect_temporal_diagnostics_from_model,
+    collect_original_mi_diagnostics_from_model,
     reset_gpu_memory_stats,
     collect_gpu_memory_stats,
     reset_starkv_per_sample_state,
     reset_kv_cache_stats,
     set_starkv_group_config,
     is_starkv_kv,
+    is_compressed_kv,
+    needs_vision_spans,
+    set_kv_cache_mode,
     collect_kv_cache_stats,
     compute_kv_cache_memory_summary,
+    collect_mi_diagnostics_from_model,
+    collect_cvi_diagnostics_from_model,
+    collect_group_specialization_from_model,
+    timed_generate,
+    reset_runtime_metrics,
+    collect_runtime_metrics,
+    RUNTIME_METRICS,
 )
 from attention_helpers import add_starkv_kv_arguments, finalize_starkv_args
 from eval_paths import (
@@ -221,6 +234,79 @@ def screenspotpro_evaluate(results):
     }
 
 
+
+def _aggregate_cvi_recon_from_results(results):
+    """Aggregate per-sample / per-layer CVI recon diagnostics."""
+    import math
+
+    layer_errs_base = []
+    layer_errs_act = []
+    layer_delta = []
+    layer_improved = 0
+    layer_total = 0
+    spearman = []
+    jaccard = []
+    replaced = []
+    scopes = {}
+    fallbacks = {}
+    for r in results:
+        by = r.get("cvi_recon_by_layer") or {}
+        if not by and isinstance(r.get("cvi_recon"), dict):
+            by = {"0": r["cvi_recon"]}
+        for st in by.values():
+            if not isinstance(st, dict):
+                continue
+            eb = st.get("recon_error_base")
+            ea = st.get("recon_error_active")
+            if isinstance(eb, (int, float)) and math.isfinite(eb):
+                layer_errs_base.append(float(eb))
+            if isinstance(ea, (int, float)) and math.isfinite(ea):
+                layer_errs_act.append(float(ea))
+            if isinstance(eb, (int, float)) and isinstance(ea, (int, float)):
+                d = float(ea) - float(eb)
+                layer_delta.append(d)
+                layer_total += 1
+                if float(ea) < float(eb) - 1e-12:
+                    layer_improved += 1
+            sp = st.get("spearman_utility_vs_base")
+            if isinstance(sp, (int, float)) and math.isfinite(sp):
+                spearman.append(float(sp))
+            jj = st.get("topk_jaccard_base_vs_active")
+            if isinstance(jj, (int, float)) and math.isfinite(jj):
+                jaccard.append(float(jj))
+            rc = st.get("topk_replaced_count")
+            if isinstance(rc, (int, float)):
+                replaced.append(float(rc))
+            sc = st.get("query_scope_resolved")
+            if sc:
+                scopes[str(sc)] = scopes.get(str(sc), 0) + 1
+            fb = st.get("query_scope_fallback_reason")
+            if fb:
+                fallbacks[str(fb)] = fallbacks.get(str(fb), 0) + 1
+
+    def _mean(xs):
+        return sum(xs) / len(xs) if xs else None
+
+    return {
+        "n_samples": len(results),
+        "n_layer_obs": layer_total,
+        "recon_error_base_mean": _mean(layer_errs_base),
+        "recon_error_active_mean": _mean(layer_errs_act),
+        "recon_error_delta_mean": _mean(layer_delta),
+        "frac_layers_recon_improved": (layer_improved / layer_total) if layer_total else None,
+        "spearman_utility_vs_base_mean": _mean(spearman),
+        "topk_jaccard_mean": _mean(jaccard),
+        "topk_replaced_mean": _mean(replaced),
+        "query_scope_resolved_counts": scopes,
+        "query_scope_fallback_counts": fallbacks,
+    }
+
+
+def _write_group_specialization_reports(results_dir, results, summary_results):
+    """No-op: group specialization diagnostics removed."""
+    return
+
+
 if __name__ == '__main__':
     freeze_support()
     
@@ -229,12 +315,14 @@ if __name__ == '__main__':
     add_screenspot_pro_dataset_args(parser)
     parser.add_argument('--task', type=str, required=True, choices=["all"])
     parser.add_argument('--debug', default=None, type=int)
+    parser.add_argument('--sample_offset', default=0, type=int,
+                        help='Skip the first N deterministic samples (held-out calibration).')
     parser.add_argument('--num_chunks', type=int, default=1, help='Number of chunks to split data across GPUs.')
     parser.add_argument('--chunk_id', type=int, default=0, help='Which chunk (0-indexed) this process handles.')
     parser.add_argument('--max_new_tokens', type=int, default=400)
     parser.add_argument('--device', type=str, default=None, help='Device to use (cuda/mps/cpu). If not specified, will auto-detect best available device.')
     parser.add_argument('--model_dtype', type=str, default="auto", choices=["auto", "bfloat16", "float16", "float32"], help='Data type to use (auto/bfloat16/float16/float32).')
-    parser.add_argument('--attention_implementation', type=str, default="eager", choices=["eager", "sdpa", "flash_attention_2"], help='Attention implementation to use (eager/flash_attention_2).')
+    add_flash_attention_2_argument(parser)
     add_starkv_kv_arguments(
         parser,
         kv_cache_default="original",
@@ -278,23 +366,36 @@ if __name__ == '__main__':
         print(f"Device validation error: {e}. Using CPU as fallback.")
         device = "cpu"
 
-    if args.attention_implementation == "flash_attention_2" and device != "cuda":
-        raise SystemExit(
-            "flash_attention_2 requires CUDA (FlashAttention-2 is not supported on CPU/MPS). "
-            f"Current device selection: {device!r}. Use --device cuda or a CUDA-enabled machine."
-        )
+    require_flash_attention_2(args, device)
 
     model_path = args.model_path
     print("model_path: ", model_path)
 
+    # Processor from local model_path only (no HuggingFace hub).
+    # Keep parse min/max aligned with local preprocessor_config (same as androidcontrol).
     if "UI-TARS" in args.model_path:
         processor = AutoProcessor.from_pretrained(
-            "Qwen/Qwen2.5-VL-7B-Instruct",
-            min_pixels=args.min_pixels,
-            max_pixels=args.max_pixels,
+            model_path, trust_remote_code=True, local_files_only=True, use_fast=False
+        )
+        ip = getattr(processor, "image_processor", None)
+        # Explicit CLI override only when user changes away from ui_tars_utils defaults.
+        if ip is not None:
+            if int(args.min_pixels) != int(MIN_PIXELS):
+                ip.min_pixels = int(args.min_pixels)
+            if int(args.max_pixels) != int(MAX_PIXELS):
+                ip.max_pixels = int(args.max_pixels)
+            if getattr(ip, "min_pixels", None) is not None:
+                MIN_PIXELS = int(ip.min_pixels)
+            if getattr(ip, "max_pixels", None) is not None:
+                MAX_PIXELS = int(ip.max_pixels)
+        print(
+            f"UI-TARS processor from {model_path}; "
+            f"min_pixels={MIN_PIXELS}, max_pixels={MAX_PIXELS}"
         )
     elif "opencua" in args.model_path.lower():
-        processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            args.model_path, trust_remote_code=True, local_files_only=True, use_fast=False
+        )
         tokenizer = processor.tokenizer
     else:
         raise NotImplementedError("Model not supported")
@@ -331,9 +432,10 @@ if __name__ == '__main__':
             )
         set_attention_implementation(model, args)
         set_kv_cache_budget(model, args)
+        if is_compressed_kv(args.kv_cache):
+            set_kv_cache_mode(model, args)
         if is_starkv_kv(args.kv_cache):
             set_starkv_group_config(model, args)
-        apply_entropy_budget_runtime(model, args)
         reset_kv_cache_stats()
     else:
         if torch.cuda.device_count() > 1:
@@ -355,9 +457,10 @@ if __name__ == '__main__':
             raise NotImplementedError("Model not supported")
         set_attention_implementation(model, args)
         set_kv_cache_budget(model, args)
+        if is_compressed_kv(args.kv_cache):
+            set_kv_cache_mode(model, args)
         if is_starkv_kv(args.kv_cache):
             set_starkv_group_config(model, args)
-        apply_entropy_budget_runtime(model, args)
         reset_gpu_memory_stats()
         reset_kv_cache_stats()
         if args.attention_implementation == "eager":
@@ -367,11 +470,11 @@ if __name__ == '__main__':
     print("Load Success")
 
     if args.task == "all":
-        task_filenames = [
+        task_filenames = sorted([
             os.path.splitext(f)[0]
             for f in os.listdir(args.screenspot_test)
             if f.endswith(".json")
-        ]
+        ])
         print("task_filenames: ", len(task_filenames))
     else:
         raise NotImplementedError("Task not implemented")
@@ -409,6 +512,11 @@ if __name__ == '__main__':
         print(f"Num of sample in {task_filename}: {len(task_data)} * {len(inst_styles)} * {len(gt_types)} * {len(languages)} = {len(task_data) * len(inst_styles) * len(gt_types) * len(languages)}")
     print(f"Total tasks: {len(tasks_to_run)}")
 
+    sample_offset = max(0, int(getattr(args, "sample_offset", 0) or 0))
+    if sample_offset:
+        tasks_to_run = tasks_to_run[sample_offset:]
+        print(f"Sample offset: skipped first {sample_offset} deterministic samples")
+
     results = []
 
     if args.debug is not None:
@@ -431,6 +539,10 @@ if __name__ == '__main__':
 
     # Start timing here
     eval_start_time = time.time()
+    if getattr(args, "runtime_metrics", False):
+        reset_runtime_metrics()
+        RUNTIME_METRICS.enable(True)
+        RUNTIME_METRICS.mark_run_start()
 
     if args.max_samples is not None and args.max_samples > 0:
         tasks_to_run = tasks_to_run[:args.max_samples]
@@ -481,18 +593,18 @@ if __name__ == '__main__':
             )
             inputs = inputs.to(device)
         elif "opencua" in args.model_path.lower():
-            # Aligned with AgentNetBench best practice: proper system message + minimal user text
+            # Match screenspotv2_eval OpenCUA path: system text folded into user turn.
+            # Separate system-role + bare instruction yields non-pyautogui JSON and 0% parse.
             OPENCUA_SYSTEM_PROMPT = (
                 "You are a GUI agent. You are given a task and a screenshot of the screen. "
                 "You need to perform a series of pyautogui actions to complete the task."
             )
             messages = [
-                {"role": "system", "content": OPENCUA_SYSTEM_PROMPT},
                 {
                     "role": "user",
                     "content": [
                         {"type": "image", "image": img_path},
-                        {"type": "text", "text": instruction},
+                        {"type": "text", "text": OPENCUA_SYSTEM_PROMPT + "\n" + instruction},
                     ],
                 },
             ]
@@ -511,7 +623,7 @@ if __name__ == '__main__':
         
 
         # Analyze vision tokens for KV cache methods that require it
-        if is_starkv_kv(args.kv_cache):
+        if needs_vision_spans(args.kv_cache):
             if "UI-TARS" in args.model_path:
                 vision_analysis = analyze_vision_tokens_multi_images(processor, image_inputs, video_inputs, text, image_count=1)
             elif "opencua" in args.model_path.lower():
@@ -523,47 +635,41 @@ if __name__ == '__main__':
                 raise NotImplementedError("Model not supported")
 
         set_window_size(model, args)
-        if is_starkv_kv(args.kv_cache):
-            set_vision_start_idx(model, vision_analysis['vision_start_idx'], args)
-            set_vision_end_idx(model, vision_analysis['vision_end_idx'], args)
+        if needs_vision_spans(args.kv_cache):
+            apply_vision_analysis_to_model(model, vision_analysis, args)
             set_alpha(model, args)
             set_temperature(model, args)
 
-        # Reset STaR-KV per-sample state (online MI / temporal / AEB) to avoid cross-sample leakage.
+        # Reset online MI and temporal state to avoid cross-sample leakage.
         reset_starkv_per_sample_state(model, args)
 
         output_text = ""
         try:
-            if "UI-TARS" in args.model_path:
-                outputs = model.generate(**inputs,
-                                    max_new_tokens=args.max_new_tokens,
-                                    pad_token_id=processor.tokenizer.eos_token_id,
-                                    output_attentions=False,
-                                    use_cache=True,
-                                    do_sample=False,
-                                    return_dict_in_generate=True)
-
-                generated_ids = outputs if not hasattr(outputs, 'sequences') else outputs.sequences
-
-                generated_ids_trimmed = [
-                    out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-                ]
-                hf_output_text = processor.batch_decode(
-                    generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-                )[0]
-                output_text = hf_output_text
-                print("output_text: ", output_text)
-            elif "opencua" in args.model_path.lower():
-                outputs = model.generate(
+            gen_kwargs = dict(
+                max_new_tokens=args.max_new_tokens,
+                pad_token_id=processor.tokenizer.eos_token_id,
+                output_attentions=False,
+                use_cache=True,
+                do_sample=False,
+                return_dict_in_generate=True,
+            )
+            if getattr(args, "runtime_metrics", False):
+                outputs, _lat = timed_generate(
+                    model,
+                    synchronize_cuda=bool(getattr(args, "runtime_metrics_sync_cuda", True)),
+                    record=True,
                     **inputs,
-                    max_new_tokens=args.max_new_tokens,
-                    pad_token_id=processor.tokenizer.eos_token_id,
-                    output_attentions=False,
-                    use_cache=True,
-                    do_sample=False,
-                    return_dict_in_generate=True,
+                    **gen_kwargs,
                 )
-                generated_ids = outputs.sequences
+            elif "UI-TARS" in args.model_path:
+                outputs = model.generate(**inputs, **gen_kwargs)
+            elif "opencua" in args.model_path.lower():
+                outputs = model.generate(**inputs, **gen_kwargs)
+            else:
+                outputs = None
+
+            if outputs is not None and ("UI-TARS" in args.model_path or "opencua" in args.model_path.lower()):
+                generated_ids = outputs if not hasattr(outputs, 'sequences') else outputs.sequences
                 generated_ids_trimmed = [
                     out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
                 ]
@@ -642,6 +748,50 @@ if __name__ == '__main__':
             "correctness": correctness,
         })
 
+        # Optional MI diagnostics (does not affect scoring).
+        if bool(getattr(args, "kv_group_mi_debug", False) or getattr(args, "runtime_metrics", False)):
+            try:
+                mi_diag = collect_mi_diagnostics_from_model(model, args.model_path)
+                sample_result["mi_stats"] = mi_diag.get("mi_stats")  # layer-0 compat
+                sample_result["mi_stats_by_layer"] = mi_diag.get("mi_stats_by_layer")
+                sample_result["mi_stats_aggregate"] = mi_diag.get("mi_stats_aggregate")
+            except Exception:
+                sample_result["mi_stats"] = None
+                sample_result["mi_stats_by_layer"] = None
+                sample_result["mi_stats_aggregate"] = None
+
+        if bool(getattr(args, "kv_group_cvi_debug", False) or getattr(args, "runtime_metrics", False)
+                or getattr(args, "kv_group_cvi_recon_diag_enable", False)):
+            try:
+                cvi_diag = collect_cvi_diagnostics_from_model(model, args.model_path)
+                sample_result["cvi_stats"] = cvi_diag.get("cvi_stats")
+                sample_result["cvi_stats_by_layer"] = cvi_diag.get("cvi_stats_by_layer")
+                sample_result["cvi_recon"] = cvi_diag.get("cvi_recon")
+                sample_result["cvi_recon_by_layer"] = cvi_diag.get("cvi_recon_by_layer")
+            except Exception:
+                sample_result["cvi_stats"] = None
+                sample_result["cvi_stats_by_layer"] = None
+                sample_result["cvi_recon"] = None
+                sample_result["cvi_recon_by_layer"] = None
+
+        if bool(
+            getattr(args, "kv_group_specialization_diag_enable", False)
+            or getattr(args, "kv_group_per_group_base_only", False)
+        ):
+            try:
+                gs = collect_group_specialization_from_model(model, args.model_path)
+                sample_result["group_specialization"] = gs.get("group_specialization")
+                sample_result["group_specialization_by_layer"] = gs.get(
+                    "group_specialization_by_layer"
+                )
+                sample_result["per_group"] = gs.get("per_group")
+                sample_result["per_group_by_layer"] = gs.get("per_group_by_layer")
+            except Exception:
+                sample_result["group_specialization"] = None
+                sample_result["group_specialization_by_layer"] = None
+                sample_result["per_group"] = None
+                sample_result["per_group_by_layer"] = None
+
         results.append(sample_result)
 
 
@@ -661,6 +811,11 @@ if __name__ == '__main__':
         logging.info(f"Saved ScreenSpot Pro detailed results to {detailed_results_path}")
 
         overall_metrics = result_report["metrics"]["overall"]
+        if getattr(args, "runtime_metrics", False):
+            RUNTIME_METRICS.mark_run_end()
+            runtime_metrics_summary = collect_runtime_metrics()
+        else:
+            runtime_metrics_summary = None
         summary_results = {
             "model_family": "opencua" if "opencua" in args.model_path.lower() else "uitars",
             "model_path": args.model_path,
@@ -672,14 +827,54 @@ if __name__ == '__main__':
             "wrong_format_samples": overall_metrics["wrong_format_num"],
             "kv_cache": args.kv_cache,
             "kv_cache_budget": args.kv_cache_budget,
-            "kv_group_selection_mode": getattr(args, "kv_group_selection_mode", "soft_global"),
             "kv_group_soft_prior_lambda": getattr(args, "kv_group_soft_prior_lambda", None),
-            "kv_group_soft_prior_source": getattr(args, "kv_group_soft_prior_source", None),
-            "kv_group_mi_saliency_weight": getattr(args, "kv_group_mi_saliency_weight", None),
-            "kv_group_online_profile_steps": getattr(args, "kv_group_online_profile_steps", None),
             "kv_group_online_profile_decay": getattr(args, "kv_group_online_profile_decay", None),
             "kv_group_online_profile_tau": getattr(args, "kv_group_online_profile_tau", None),
-            "kv_group_online_profile_lambda_ramp_steps": getattr(args, "kv_group_online_profile_lambda_ramp_steps", None),
+            "kv_group_mi_mode": getattr(args, "kv_group_mi_mode", None),
+            "kv_group_mi_reliability_gamma": getattr(args, "kv_group_mi_reliability_gamma", None),
+            "kv_group_mi_reliability_center": getattr(args, "kv_group_mi_reliability_center", None),
+            "kv_group_mi_reliability_temperature": getattr(
+                args, "kv_group_mi_reliability_temperature", None
+            ),
+            "kv_group_mi_routing_tau": getattr(args, "kv_group_mi_routing_tau", None),
+            "kv_group_mi_routing_normalization": getattr(
+                args, "kv_group_mi_routing_normalization", None
+            ),
+            "kv_group_mi_candidate_multiplier": getattr(args, "kv_group_mi_candidate_multiplier", None),
+            "kv_group_mi_positive_only": bool(getattr(args, "kv_group_mi_positive_only", True)),
+            "kv_group_mi_max_multiplier": getattr(args, "kv_group_mi_max_multiplier", None),
+            "kv_group_mi_cmi_boundary_w": getattr(args, "kv_group_mi_cmi_boundary_w", None),
+            "kv_group_mi_cmi_alpha": getattr(args, "kv_group_mi_cmi_alpha", None),
+            "kv_group_mi_cmi_beta": getattr(args, "kv_group_mi_cmi_beta", None),
+            "kv_group_mi_cmi_clip": getattr(args, "kv_group_mi_cmi_clip", None),
+            "kv_group_mi_cmi_margin": getattr(args, "kv_group_mi_cmi_margin", None),
+            "kv_group_mi_cmi_max_swaps_frac": getattr(args, "kv_group_mi_cmi_max_swaps_frac", None),
+            "kv_group_mi_cmi_cross_fit": getattr(args, "kv_group_mi_cmi_cross_fit", None),
+            "kv_group_cvi_enable": bool(getattr(args, "kv_group_cvi_enable", False)),
+            "kv_group_cvi_only": bool(getattr(args, "kv_group_cvi_only", False)),
+            "kv_group_cvi_mi_gate": bool(getattr(args, "kv_group_cvi_mi_gate", False)),
+            "kv_group_cvi_alpha": getattr(args, "kv_group_cvi_alpha", None),
+            "kv_group_cvi_clip": getattr(args, "kv_group_cvi_clip", None),
+            "kv_group_cvi_candidate_multiplier": getattr(args, "kv_group_cvi_candidate_multiplier", None),
+            "kv_group_cvi_query_scope": getattr(args, "kv_group_cvi_query_scope", "all"),
+            "kv_group_cvi_recon_diag_enable": bool(
+                getattr(args, "kv_group_cvi_recon_diag_enable", False)
+            ),
+            "kv_group_per_group_base_only": bool(
+                getattr(args, "kv_group_per_group_base_only", False)
+            ),
+            "kv_group_specialization_diag_enable": bool(
+                getattr(args, "kv_group_specialization_diag_enable", False)
+            ),
+            "seed": 1234,
+            "kv_group_online_profile_last_lam_eff": (
+                getattr(model.model.language_model.layers[0].self_attn, "kv_group_online_profile_last_lam_eff", None)
+                if "UI-TARS" in args.model_path
+                else None
+            ),
+            "original_mi_debug": collect_original_mi_diagnostics_from_model(
+                model, args.model_path
+            ) if args.kv_cache == "starkv" else None,
             "kv_group_temporal_enable": bool(getattr(args, "kv_group_temporal_enable", False)),
             "kv_group_temporal_rho": getattr(args, "kv_group_temporal_rho", None),
             "kv_group_temporal_delta": getattr(args, "kv_group_temporal_delta", None),
@@ -687,6 +882,9 @@ if __name__ == '__main__':
             "kv_group_temporal_discount_min": getattr(args, "kv_group_temporal_discount_min", None),
             "kv_group_temporal_warmup_steps": getattr(args, "kv_group_temporal_warmup_steps", None),
             "kv_group_temporal_debug": bool(getattr(args, "kv_group_temporal_debug", False)),
+            "enable_grd": bool(getattr(args, "enable_grd", False)),
+            "grd_alpha": getattr(args, "grd_alpha", None),
+            "grd_feature_dim": getattr(args, "grd_feature_dim", None),
             "alpha": getattr(args, "alpha", None),
             "temperature": getattr(args, "temperature", None),
             "attention_implementation": args.attention_implementation,
@@ -698,24 +896,53 @@ if __name__ == '__main__':
             "num_tasks_this_chunk": len(tasks_to_run),
             "total_tasks_before_chunk": total_tasks,
             "max_new_tokens": args.max_new_tokens,
-            "entropy_budget_enable": bool(getattr(args, "kv_entropy_budget_enable", False)),
-            "entropy_budget_active": bool(getattr(args, "kv_entropy_budget_enable", False) and getattr(args, "kv_cache", None) == "starkv"),
-            "entropy_budget_skipped_reason": (
-                "AEB applies only when --kv_cache starkv."
-                if (bool(getattr(args, "kv_entropy_budget_enable", False)) and getattr(args, "kv_cache", None) != "starkv")
-                else None
-            ),
             "gpu_memory_stats": collect_gpu_memory_stats(),
             "kv_cache_stats": compute_kv_cache_memory_summary(collect_kv_cache_stats()),
-            "temporal_discount_debug": getattr(model.model.language_model.layers[0].self_attn, "kv_group_temporal_last_stats", None) if getattr(args, "kv_group_temporal_enable", False) and "UI-TARS" in args.model_path else None,
+            "runtime_metrics": runtime_metrics_summary,
+            "temporal_discount_debug": (
+                collect_temporal_diagnostics_from_model(model, args.model_path)
+                if bool(getattr(args, "kv_group_temporal_enable", False)) and is_starkv_kv(args.kv_cache)
+                else None
+            ),
             "eval_duration_seconds": round(time.time() - eval_start_time, 2),
-            "entropy_budget_debug": collect_entropy_budget_stats(model, args),
         }
 
         summary_results_path = os.path.join(args.results_dir, 'screenspotpro_summary_results.json')
         with open(summary_results_path, 'w') as f:
             json.dump(summary_results, f, indent=2, ensure_ascii=False)
         logging.info(f"Saved ScreenSpot Pro summary results to {summary_results_path}")
+        # Read-only CVI reconstruction diagnostics (does not affect scoring).
+        if bool(getattr(args, "kv_group_cvi_recon_diag_enable", False) or getattr(args, "kv_group_cvi_debug", False)):
+            try:
+                diag = _aggregate_cvi_recon_from_results(results)
+                diag_path = os.path.join(args.results_dir, "cvi_diagnostics.json")
+                with open(diag_path, "w") as f:
+                    json.dump(diag, f, indent=2, ensure_ascii=False)
+                md_path = os.path.join(args.results_dir, "cvi_diagnostics.md")
+                with open(md_path, "w") as f:
+                    f.write("# CVI diagnostics\n\n")
+                    for k, v in diag.items():
+                        f.write(f"- **{k}**: {v}\n")
+                    f.write(
+                        "\nExpected if CVI target is correct: "
+                        "`frac_layers_recon_improved` ≫ 0.5 and "
+                        "`recon_error_delta_mean` < 0.\n"
+                    )
+                logging.info(f"Saved CVI diagnostics to {diag_path}")
+            except Exception as e:
+                logging.warning(f"CVI diagnostics write failed: {e}")
+
+        if bool(
+            getattr(args, "kv_group_specialization_diag_enable", False)
+            or getattr(args, "kv_group_per_group_base_only", False)
+        ):
+            try:
+                gs_path_json, gs_path_md, gs_path_raw = _write_group_specialization_reports(
+                    args.results_dir, results, summary_results
+                )
+                logging.info(f"Saved group specialization diagnostics to {gs_path_json}")
+            except Exception as e:
+                logging.warning(f"Group specialization diagnostics write failed: {e}")
 
         print(f"\nScreenSpot Pro Summary:")
         print(f"{'Metric':<25} {'Value':<15}")

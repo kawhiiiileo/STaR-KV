@@ -324,7 +324,7 @@ def parse_action_to_structure_output(text,
 
 
 def analyze_vision_tokens_multi_images(processor, image_inputs, video_inputs, text, image_count=1):
-    """Vision token span indices for UI-TARS / Qwen2.5-VL (used by STaR-KV eval)."""
+    """Vision token span indices + real post-merge grids for UI-TARS / Qwen2.5-VL."""
     text_only_inputs = processor(
         text=[text],
         images=None,
@@ -368,9 +368,54 @@ def analyze_vision_tokens_multi_images(processor, image_inputs, video_inputs, te
     assert image_count == len(vision_start_indices) == len(vision_end_indices), (
         f"Expected {image_count} images but found {len(vision_start_indices)} vision token pairs"
     )
+
+    # Real token grid from image_grid_thw after spatial merge (not sqrt approximation).
+    merge_size = 2
+    ip = getattr(processor, "image_processor", None)
+    if ip is not None:
+        merge_size = int(getattr(ip, "merge_size", None) or getattr(ip, "spatial_merge_size", None) or 2)
+    # Prefer model-side merge if exposed on processor kwargs / attributes.
+    for attr in ("spatial_merge_size", "merge_size"):
+        v = getattr(processor, attr, None)
+        if v is not None:
+            merge_size = int(v)
+            break
+
+    vision_token_grids = []
+    image_grid_thw_list = None
+    thw = getattr(full_inputs, "image_grid_thw", None)
+    if thw is not None:
+        if hasattr(thw, "detach"):
+            thw_list = thw.detach().cpu().tolist()
+        else:
+            thw_list = thw
+        image_grid_thw_list = thw_list
+        # Normalize to list of [T,H,W]
+        rows = thw_list
+        if len(rows) == 3 and not isinstance(rows[0], (list, tuple)):
+            rows = [rows]
+        merge = max(1, int(merge_size))
+        for row in rows:
+            if isinstance(row, (list, tuple)) and len(row) >= 3:
+                _t, patch_h, patch_w = int(row[0]), int(row[1]), int(row[2])
+                vision_token_grids.append((max(1, patch_h // merge), max(1, patch_w // merge)))
+        # Validate against measured span lengths; drop grids on mismatch.
+        if len(vision_token_grids) == len(vision_start_indices):
+            for (s, e), (gh, gw) in zip(
+                zip(vision_start_indices, vision_end_indices), vision_token_grids
+            ):
+                if (e - s) != gh * gw:
+                    vision_token_grids = []
+                    break
+        else:
+            vision_token_grids = []
+
     return {
         "vision_start_idx": vision_start_indices,
         "vision_end_idx": vision_end_indices,
+        "vision_token_grids": vision_token_grids,
+        "image_grid_thw": image_grid_thw_list,
+        "merge_size": merge_size,
     }
 
 

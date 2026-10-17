@@ -88,6 +88,21 @@ def add_androidcontrol_dataset_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_osworld_dataset_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--osworld_data",
+        type=str,
+        default=_env("OSWORLD_DATA"),
+        help="OSWorld evaluation_examples root (default: OSWORLD_DATA).",
+    )
+    parser.add_argument(
+        "--osworld_traj_dir",
+        type=str,
+        default=_env("OSWORLD_TRAJ_DIR"),
+        help="Offline trajectory root with traj.jsonl + screenshots (default: OSWORLD_TRAJ_DIR).",
+    )
+
+
 def add_agentnetbench_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--agentnetbench_data",
@@ -103,6 +118,51 @@ def add_agentnetbench_dataset_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def normalize_agentnetbench_img_root(args: argparse.Namespace) -> None:
+    """Accept either ``.../test_data/images`` or ``.../test_data`` as --agentnetbench_imgs."""
+    root = getattr(args, "agentnetbench_imgs", None)
+    if not root or not os.path.isdir(root):
+        return
+    root = os.path.abspath(root)
+    nested = os.path.join(root, "images")
+    if not os.path.isdir(nested):
+        args.agentnetbench_imgs = root
+        return
+    try:
+        has_imgs = any(
+            f.lower().endswith((".png", ".jpg", ".jpeg", ".webp")) for f in os.listdir(root)
+        )
+    except OSError:
+        has_imgs = False
+    if not has_imgs:
+        print(f"[paths] agentnetbench_imgs: using nested images dir {nested}")
+        args.agentnetbench_imgs = nested
+    else:
+        args.agentnetbench_imgs = root
+
+
+def resolve_agentnetbench_image_path(imgs_root: str, filename: str) -> str:
+    """Resolve a trajectory image filename under imgs_root (with common fallbacks)."""
+    if not filename:
+        return ""
+    if os.path.isabs(filename) and os.path.exists(filename):
+        return filename
+    direct = os.path.join(imgs_root, filename)
+    if os.path.exists(direct):
+        return direct
+    nested = os.path.join(imgs_root, "images", filename)
+    if os.path.exists(nested):
+        return nested
+    base = os.path.basename(filename)
+    for cand in (
+        os.path.join(imgs_root, base),
+        os.path.join(imgs_root, "images", base),
+    ):
+        if os.path.exists(cand):
+            return cand
+    return direct
+
+
 def validate_required_paths(args: argparse.Namespace, fields: Iterable[str]) -> None:
     missing = [f for f in fields if not getattr(args, f, None)]
     if missing:
@@ -116,11 +176,19 @@ def validate_required_paths(args: argparse.Namespace, fields: Iterable[str]) -> 
 
 
 def resolve_opencua_model_path(args: argparse.Namespace) -> None:
-    """Use OPENCUA_MODEL_PATH when model_path looks like default UI-TARS."""
+    """Expand OpenCUA shorthand; never rewrite an explicit UI-TARS path.
+
+    If ``args.model_path`` already points at UI-TARS, leave it alone. Only map
+    OpenCUA HF ids / missing local paths onto ``OPENCUA_MODEL_PATH``.
+    """
     opencua = _env("OPENCUA_MODEL_PATH")
     if not opencua:
         return
     mp = getattr(args, "model_path", None) or ""
-    uitars = _env("UITARS_MODEL_PATH") or ""
-    if "OpenCUA" in mp or (uitars and os.path.normpath(mp) == os.path.normpath(uitars)):
-        args.model_path = opencua
+    if not mp:
+        return
+    if "UI-TARS" in mp or "ui-tars" in mp.lower():
+        return
+    if "OpenCUA" in mp or "opencua" in mp.lower():
+        if not os.path.isdir(mp):
+            args.model_path = opencua

@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
-"""
-STaR-KV grouped compression (soft_global): pool + spatial boost + MI + temporal + AEB + top-k.
-================================================================================
+"""Canonical STaR-KV shared-index KV compressor.
 
-Uses recent-window attention pooling over past tokens. Token scores are head-mean
-attention, scaled by group priors (see starkv_mi), optional temporal (starkv_temporal)
-and AEB sharpening (starkv_aeb), then global top-k gather.
+The only supported path is recent-window attention pooling, spatial saliency,
+GQA-group MI, exponential TEM, exact SFR, and a protected recent window.
 """
 
 from __future__ import annotations
@@ -17,10 +14,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from starkv_aeb import sharpen_scores_with_aeb, update_aeb_from_attn_cache
-from starkv_mi import apply_mi_prior, vision_span_from_parent
-from starkv_temporal import temporal_apply_to_scaled
-from starkv_utils import _RecentWindowKVPool
+from starkv.starkv_utils import _RecentWindowKVPool
+from starkv.starkv_temporal import temporal_apply_to_scaled
+from starkv.starkv_mi import apply_mi_prior, vision_span_from_parent
+from starkv.starkv_sfr import (
+    apply_sfr,
+    apply_tem_discount_to_sfr,
+    assert_selection_invariants,
+)
 
 
 def apply_starkv_spatial_to_attn_cache(
@@ -28,7 +29,7 @@ def apply_starkv_spatial_to_attn_cache(
     hidden_states: Optional[torch.Tensor],
     attn_parent,
 ) -> torch.Tensor:
-    """Boost visual tokens in attn_cache with alpha * softmax(norm(hidden)/tau)."""
+    """Boost visual tokens with alpha * softmax(norm(hidden) / tau_res)."""
     if hidden_states is None or attn_parent is None:
         return attn_cache
     cfg = getattr(attn_parent, "config", None)
@@ -38,7 +39,7 @@ def apply_starkv_spatial_to_attn_cache(
     if alpha is None or float(alpha) <= 0.0:
         return attn_cache
     alpha = float(alpha)
-    temperature = float(getattr(cfg, "temperature", 1.0) or 1.0) if cfg is not None else 1.0
+    tau_res = float(getattr(cfg, "temperature", 1.0) or 1.0) if cfg is not None else 1.0
     L = attn_cache.size(-1)
     span = vision_span_from_parent(attn_parent, L)
     if span is None:
@@ -49,15 +50,36 @@ def apply_starkv_spatial_to_attn_cache(
     normalized_scores = torch.zeros_like(importance_scores)
     for batch_idx in range(importance_scores.shape[0]):
         batch_scores = importance_scores[batch_idx]
-        standardized_scores = (batch_scores - batch_scores.mean()) / (batch_scores.std() + 1e-8)
-        normalized_scores[batch_idx] = torch.softmax(standardized_scores / temperature, dim=0)
+        # Preserve the exact normalization used by the main-table run.
+        if batch_scores.numel() <= 1:
+            standardized_scores = torch.zeros_like(batch_scores)
+        else:
+            standardized_scores = (batch_scores - batch_scores.mean()) / (
+                batch_scores.std() + 1e-8
+            )
+        normalized_scores[batch_idx] = torch.softmax(standardized_scores / tau_res, dim=0)
     hidden_state_scores = normalized_scores.unsqueeze(1) * alpha
     attn_cache[:, :, v_s:v_e] += hidden_state_scores.to(device=attn_cache.device, dtype=attn_cache.dtype)
     return attn_cache
 
 
+def _pool1d(x: torch.Tensor, pooling: str, kernel_size: int) -> torch.Tensor:
+    """Pool over last dim; accepts ``[H, T]`` or ``[B, H, T]``."""
+    squeeze = False
+    if x.ndim == 2:
+        x = x.unsqueeze(0)
+        squeeze = True
+    if pooling == "avgpool":
+        y = F.avg_pool1d(x, kernel_size=kernel_size, padding=kernel_size // 2, stride=1)
+    elif pooling == "maxpool":
+        y = F.max_pool1d(x, kernel_size=kernel_size, padding=kernel_size // 2, stride=1)
+    else:
+        raise ValueError("Pooling method not supported")
+    return y.squeeze(0) if squeeze else y
+
+
 class STARKVGroupCluster(_RecentWindowKVPool):
-    """soft_global grouped KV compression (shared indices across heads)."""
+    """Shared-index Top-K KV compression with MI, TEM, and SFR."""
 
     def __init__(
         self,
@@ -72,8 +94,6 @@ class STARKVGroupCluster(_RecentWindowKVPool):
             kernel_size=kernel_size,
             pooling=pooling,
         )
-        self._aeb_temperature_ema = None
-        self._aeb_last_debug = None
 
     def update_kv(
         self,
@@ -86,18 +106,17 @@ class STARKVGroupCluster(_RecentWindowKVPool):
     ):
         assert key_states.shape[-2] == query_states.shape[-2]
         bsz, num_heads, q_len, head_dim = query_states.shape
-        n_kv = max(1, num_heads // max(1, num_key_value_groups))
 
-        attn_parent = getattr(self, "attn_parent", None)
-        if attn_parent is not None and getattr(attn_parent, "kv_group_temporal_enable", False):
-            setattr(
-                attn_parent,
-                "kv_group_temporal_step",
-                int(getattr(attn_parent, "kv_group_temporal_step", 0) or 0) + 1,
-            )
-
-        if q_len < self.max_capacity_prompt:
+        if q_len <= self.max_capacity_prompt:
             return key_states, value_states
+
+        # A tiny total budget may be entirely occupied by the recent window.
+        # Avoid historical scoring/selection when B = 0.
+        if self.max_capacity_prompt == self.window_size:
+            return (
+                key_states[..., -self.window_size :, :],
+                value_states[..., -self.window_size :, :],
+            )
 
         attn_weights = torch.matmul(
             query_states[..., -self.window_size :, :], key_states.transpose(2, 3)
@@ -112,67 +131,121 @@ class STARKVGroupCluster(_RecentWindowKVPool):
         mask = mask.to(attn_weights.device)
         attention_mask = mask[None, None, :, :]
         attn_weights[:, :, -self.window_size :, -self.window_size :] += attention_mask
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights_sum = attn_weights[:, :, -self.window_size :, : -self.window_size].sum(dim=-2)
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(
+            query_states.dtype
+        )
+        attn_window_past = attn_weights[:, :, -self.window_size :, : -self.window_size]
+        attn_weights_sum = attn_window_past.sum(dim=-2)
 
-        if self.pooling == "avgpool":
-            attn_cache = F.avg_pool1d(
-                attn_weights_sum,
-                kernel_size=self.kernel_size,
-                padding=self.kernel_size // 2,
-                stride=1,
-            )
-        elif self.pooling == "maxpool":
-            attn_cache = F.max_pool1d(
-                attn_weights_sum,
-                kernel_size=self.kernel_size,
-                padding=self.kernel_size // 2,
-                stride=1,
-            )
-        else:
-            raise ValueError("Pooling method not supported")
-
+        attn_parent = getattr(self, "attn_parent", None)
+        attn_cache = _pool1d(attn_weights_sum, self.pooling, self.kernel_size)
         attn_cache = apply_starkv_spatial_to_attn_cache(attn_cache, hidden_states, attn_parent)
 
         past_seq_len = key_states.size(2) - self.window_size
         base_capacity = self.max_capacity_prompt
-
-        update_aeb_from_attn_cache(self, attn_cache)
-        k_keep = int(max(1, min(base_capacity - self.window_size, past_seq_len, attn_cache.size(-1))))
+        k_keep = int(min(base_capacity - self.window_size, past_seq_len, attn_cache.size(-1)))
+        tem_on = bool(getattr(attn_parent, "kv_group_temporal_enable", False)) if attn_parent else False
+        if tem_on:
+            attn_parent.kv_group_temporal_step = int(getattr(attn_parent, "kv_group_temporal_step", 0) or 0) + 1
 
         key_out_list = []
         val_out_list = []
         for b in range(bsz):
             ac = attn_cache[b]
-            S, w_g, lam_eff = apply_mi_prior(
-                ac, attn_parent, past_seq_len, n_kv, num_key_value_groups
+            heads_per_group = int(num_key_value_groups)
+            if heads_per_group <= 0 or ac.shape[0] % heads_per_group != 0:
+                raise ValueError(f"cannot map {ac.shape[0]} heads to GQA groups of {heads_per_group}")
+            n_groups = ac.shape[0] // heads_per_group
+            S_mi, w_g, lam_eff = apply_mi_prior(
+                ac, attn_parent, past_seq_len, n_groups, heads_per_group
             )
-
             base = ac.mean(dim=0)
-            g_star = S.argmax(dim=0)
-            w_star = w_g[g_star] * float(n_kv)
+            n_sub = int(S_mi.size(0))
+            g_star = S_mi.argmax(dim=0)
+            w_star = w_g[g_star] * float(n_sub)
             scaled = base * ((1.0 - lam_eff) + lam_eff * w_star)
+            if tem_on:
+                scaled = temporal_apply_to_scaled(
+                    scaled, S_mi, attn_parent, past_seq_len, n_groups
+                )
+            kk = min(k_keep, past_seq_len, scaled.numel())
+            idx_top = None
+            sfr_on = bool(
+                getattr(attn_parent, "kv_group_sfr_enable", False)
+            ) if attn_parent else False
+            if sfr_on and attn_parent is not None and kk > 0:
+                # Use the same recent-window attention mass as the base score.
+                # TEM is grafted into SFR coverage so stale frames cannot be
+                # revived by the specialist fairness term.
+                head_mass = attn_weights_sum[b].to(
+                    device=scaled.device, dtype=torch.float32
+                )
+                head_mass = apply_tem_discount_to_sfr(head_mass, attn_parent)
+                window = int(self.window_size)
+                protected_mass = attn_weights[
+                    b, :, -window:, -window:
+                ].sum(dim=(-2, -1)).to(
+                    device=scaled.device, dtype=torch.float32
+                )
+                raw_lambda = getattr(attn_parent, "kv_group_sfr_lambda", 0.3)
+                sfr_lambda = 0.3 if raw_lambda is None else float(raw_lambda)
+                if sfr_lambda > 0.0:
+                    sfr_result = apply_sfr(
+                        scaled.float(),
+                        head_mass,
+                        kk,
+                        protected_mass=protected_mass,
+                        lam=sfr_lambda,
+                    )
+                    idx_top = sfr_result.indices.to(
+                        device=scaled.device, dtype=torch.long
+                    )
 
-            scaled = temporal_apply_to_scaled(scaled, S, attn_parent, past_seq_len, n_kv)
-            scaled = sharpen_scores_with_aeb(scaled, self)
+            if idx_top is None:
+                idx_top = torch.topk(scaled, kk, dim=-1).indices
 
-            kk = min(k_keep, scaled.numel(), past_seq_len)
-            _, idx_top = torch.topk(scaled, kk, dim=-1)
+            # Always gather in original token-position order (strictly increasing).
+            # Selector order must never alter the causal KV timeline.
             idx_sorted = idx_top.sort().values
 
-            idx_b = idx_sorted.unsqueeze(0).unsqueeze(0).expand(1, num_heads, -1).unsqueeze(-1).expand(
-                -1, -1, -1, head_dim
+            # Fail closed if the canonical selector violates cache invariants.
+            if sfr_on and attn_parent is not None and kk > 0:
+                assert_selection_invariants(
+                    idx_sorted,
+                    k=kk,
+                    n_tokens=int(past_seq_len),
+                )
+            idx_b = (
+                idx_sorted.unsqueeze(0)
+                .unsqueeze(0)
+                .expand(1, num_heads, -1)
+                .unsqueeze(-1)
+                .expand(-1, -1, -1, head_dim)
             )
+
             ks = key_states[b : b + 1]
             vs = value_states[b : b + 1]
             k_past_compress = ks[:, :, : -self.window_size, :].gather(dim=2, index=idx_b)
             v_past_compress = vs[:, :, : -self.window_size, :].gather(dim=2, index=idx_b)
+            # Same indices for K and V; recent window appended after compressed past.
             k_cur = ks[:, :, -self.window_size :, :]
             v_cur = vs[:, :, -self.window_size :, :]
-            key_out_list.append(torch.cat([k_past_compress, k_cur], dim=2))
-            val_out_list.append(torch.cat([v_past_compress, v_cur], dim=2))
+            key_out = torch.cat([k_past_compress, k_cur], dim=2)
+            val_out = torch.cat([v_past_compress, v_cur], dim=2)
+            if sfr_on and attn_parent is not None and kk > 0:
+                expect_len = int(kk) + int(self.window_size)
+                if int(key_out.size(2)) != expect_len or int(val_out.size(2)) != expect_len:
+                    raise AssertionError(
+                        f"KV length after gather {key_out.size(2)}/{val_out.size(2)} "
+                        f"!= K+window={expect_len}"
+                    )
+            key_out_list.append(key_out)
+            val_out_list.append(val_out)
 
         return torch.cat(key_out_list, dim=0), torch.cat(val_out_list, dim=0)
 
 
-__all__ = ["STARKVGroupCluster", "apply_starkv_spatial_to_attn_cache"]
+__all__ = [
+    "STARKVGroupCluster",
+    "apply_starkv_spatial_to_attn_cache",
+]

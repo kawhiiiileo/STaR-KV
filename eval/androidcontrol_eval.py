@@ -34,28 +34,42 @@ from ui_tars_utils import (
 )
 
 from attention_helpers import (
+    add_flash_attention_2_argument,
+    require_flash_attention_2,
     replace_qwen2_5_vl,
     replace_opencua,
     set_attention_implementation,
     configure_accelerate_skip_attention,
     set_kv_cache_budget,
     set_vision_start_idx,
+    apply_vision_analysis_to_model,
     set_vision_end_idx,
     set_alpha,
     set_window_size,
     set_move_attention_to_cpu,
     set_temperature,
-    apply_entropy_budget_runtime,
     reset_starkv_per_sample_state,
-    collect_entropy_budget_stats,
+    collect_temporal_diagnostics_from_model,
+    collect_original_mi_diagnostics_from_model,
     collect_gpu_memory_stats,
+    reset_gpu_memory_stats,
     collect_kv_cache_stats,
     reset_kv_cache_stats,
     compute_kv_cache_memory_summary,
     set_starkv_group_config,
     is_starkv_kv,
+    is_compressed_kv,
+    needs_vision_spans,
+    set_kv_cache_mode,
     add_starkv_kv_arguments,
     finalize_starkv_args,
+    timed_generate,
+    reset_runtime_metrics,
+    collect_runtime_metrics,
+    RUNTIME_METRICS,
+)
+from trajectory_protocol import (
+    PROTOCOL, episode_id, trajectory_samples, protocol_fingerprint, resume_boundary,
 )
 from eval_paths import (
     add_model_path_argument,
@@ -514,11 +528,23 @@ def _valid_click_point(click_point) -> bool:
     return isinstance(click_point, (list, tuple)) and len(click_point) >= 2
 
 
+def _ac_sample_step_index(sample: Dict[str, Any]) -> int:
+    """UGround `500_steps.json` uses `step`; some dumps use `step_index`."""
+    raw = sample.get("step_index", None)
+    if raw is None:
+        raw = sample.get("step", 0)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _resolve_episode_index_path(args):
     candidates = [
         os.path.join(args.androidcontrol_imgs, "android_control_test.json"),
         os.path.join(os.path.dirname(args.androidcontrol_test.rstrip(os.sep)), "android_control_test.json"),
         os.path.join(os.path.dirname(args.androidcontrol_imgs.rstrip(os.sep)), "android_control_test.json"),
+        os.path.join(args.androidcontrol_test, "android_control_test.json"),
     ]
     for path in candidates:
         if os.path.isfile(path):
@@ -526,15 +552,11 @@ def _resolve_episode_index_path(args):
     return None
 
 
-def load_episode_index(args):
-    """episode_id -> ordered list of {screenshot, step_instruction} from full test split."""
-    path = _resolve_episode_index_path(args)
-    if path is None:
-        print("[history] android_control_test.json not found; GT history frames disabled")
-        return None
+def _load_episode_index_from_json(path: str) -> Dict[str, List[Dict[str, str]]]:
+    """Legacy android_control_test.json layout (episode.screenshot_paths / step_instructions)."""
     with open(path, encoding="utf-8") as f:
         rows = json.load(f)
-    out = {}
+    out: Dict[str, List[Dict[str, str]]] = {}
     for row in rows:
         ep = row.get("episode") or {}
         eid = ep.get("episode_id")
@@ -542,14 +564,109 @@ def load_episode_index(args):
             continue
         paths = ep.get("screenshot_paths") or []
         acts = ep.get("actions") or []
-        instrs = ep.get("step_instructions") or [""] * len(acts)
+        instrs = ep.get("step_instructions") or [""] * max(len(acts), len(paths), 1)
+        n = max(len(acts), len(paths), len(instrs))
         steps = []
-        for i in range(len(acts)):
+        for i in range(n):
             shot = paths[i] if i < len(paths) else (paths[-1] if paths else "")
             ins = instrs[i] if i < len(instrs) else ""
             steps.append({"screenshot": shot, "step_instruction": ins})
         out[str(eid)] = steps
-    print(f"[history] Loaded episode index from {path} ({len(out)} episodes)")
+    return out
+
+
+_SCREENSHOT_RE = re.compile(r"^screenshot_(\d+)\.(png|jpg|jpeg|webp)$", re.IGNORECASE)
+
+
+def _build_episode_index_from_image_dirs(
+    imgs_root: str,
+    samples: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, List[Dict[str, str]]]:
+    """
+    Local UGround-style layout:
+      {androidcontrol_imgs}/{episode_id}/screenshot_{i}.png
+    Optionally enrich step_instruction from eval samples / previous_actions.
+    """
+    out: Dict[str, List[Dict[str, str]]] = {}
+    if not os.path.isdir(imgs_root):
+        return out
+
+    ep_ids: List[str] = []
+    if samples:
+        seen = set()
+        for s in samples:
+            eid = str(s.get("episode_id", "")).strip()
+            if eid and eid not in seen:
+                seen.add(eid)
+                ep_ids.append(eid)
+    if not ep_ids:
+        for name in os.listdir(imgs_root):
+            path = os.path.join(imgs_root, name)
+            if os.path.isdir(path) and name not in ("data",):
+                ep_ids.append(name)
+
+    for eid in ep_ids:
+        ep_dir = os.path.join(imgs_root, eid)
+        if not os.path.isdir(ep_dir):
+            continue
+        indexed: Dict[int, str] = {}
+        for fname in os.listdir(ep_dir):
+            m = _SCREENSHOT_RE.match(fname)
+            if not m:
+                continue
+            indexed[int(m.group(1))] = os.path.join(eid, fname)
+        if not indexed:
+            continue
+        max_i = max(indexed)
+        steps = [{"screenshot": "", "step_instruction": ""} for _ in range(max_i + 1)]
+        for i, rel in indexed.items():
+            steps[i]["screenshot"] = rel
+        out[str(eid)] = steps
+
+    if samples:
+        for s in samples:
+            eid = str(s.get("episode_id", "")).strip()
+            if eid not in out:
+                continue
+            sid = _ac_sample_step_index(s)
+            instr = s.get("step_instruction") or ""
+            if 0 <= sid < len(out[eid]) and instr:
+                out[eid][sid]["step_instruction"] = instr
+            prev = s.get("previous_actions") or []
+            for i, text in enumerate(prev):
+                if i < len(out[eid]) and text and not out[eid][i]["step_instruction"]:
+                    out[eid][i]["step_instruction"] = text
+            shot = s.get("screenshot") or ""
+            if shot and 0 <= sid < len(out[eid]) and not out[eid][sid]["screenshot"]:
+                out[eid][sid]["screenshot"] = shot
+
+    return out
+
+
+def load_episode_index(args, samples: Optional[List[Dict[str, Any]]] = None):
+    """episode_id -> ordered list of {screenshot, step_instruction}.
+
+    Prefer legacy android_control_test.json when present; otherwise build from
+    local `{episode_id}/screenshot_*.png` directories (UGround / demisama layout).
+    """
+    path = _resolve_episode_index_path(args)
+    if path is not None:
+        out = _load_episode_index_from_json(path)
+        print(f"[history] Loaded episode index from {path} ({len(out)} episodes)")
+        return out
+
+    out = _build_episode_index_from_image_dirs(args.androidcontrol_imgs, samples=samples)
+    if not out:
+        print(
+            "[history] No android_control_test.json and no episode screenshot dirs found; "
+            "GT history frames disabled"
+        )
+        return None
+    n_shots = sum(1 for steps in out.values() for st in steps if st.get("screenshot"))
+    print(
+        f"[history] Built episode index from image dirs under {args.androidcontrol_imgs} "
+        f"({len(out)} episodes, {n_shots} screenshots)"
+    )
     return out
 
 
@@ -562,12 +679,12 @@ def _resolve_screenshot_path(args, screenshot_rel: str) -> str:
 
 
 def _append_ac_history_messages(messages, sample, episode_index, args, previous_actions):
-    """Inject GT history screenshots + step text from full episode index."""
+    """Inject GT history screenshots + step text from episode index."""
     hist_steps_used = 0
     if not args.use_history_frames or episode_index is None:
         return hist_steps_used
     ep_id = str(sample.get("episode_id", ""))
-    sid_i = int(sample.get("step_index", 0))
+    sid_i = _ac_sample_step_index(sample)
     if ep_id not in episode_index or sid_i <= 0:
         return hist_steps_used
     ep_steps = episode_index[ep_id]
@@ -619,19 +736,12 @@ if __name__ == '__main__':
     parser.add_argument('--max_new_tokens', type=int, default=600)
     parser.add_argument('--device', type=str, default=None, help='Device to use (cuda/mps/cpu). If not specified, will auto-detect best available device.')
     parser.add_argument('--model_dtype', type=str, default="bfloat16", choices=["auto", "bfloat16", "float16", "float32"], help='Data type to use (auto/bfloat16/float16/float32).')
-    parser.add_argument('--attention_implementation', type=str, default="flash_attention_2", choices=["eager", "sdpa", "flash_attention_2"], help='Attention implementation to use (eager/flash_attention_2).')
+    add_flash_attention_2_argument(parser)
     add_starkv_kv_arguments(
         parser,
         kv_cache_default="original",
         kv_cache_budget_default=100,
-        soft_prior_source_default="mi_saliency",
-        online_profile_steps_default=5,
-        online_profile_lambda_ramp_default=10,
-        temporal_warmup_default=0,
-        aeb_enable_action="boolean_optional",
-        aeb_min_scale_default=0.95,
-        aeb_max_scale_default=1.05,
-        include_mi_granularity=True,
+        temporal_enable_action="boolean_optional",
     )
     add_results_dir_argument(parser)
     parser.add_argument('--instruction_level', type=str, default="high", choices=["high", "low"], help='Instruction level to use (high/low).')
@@ -653,11 +763,16 @@ if __name__ == '__main__':
     args = parser.parse_args()
     validate_required_paths(args, ("model_path", "androidcontrol_imgs", "androidcontrol_test"))
     resolve_opencua_model_path(args)
+    # Keep False so omitting TEM works for component ablations.
     finalize_starkv_args(
         args,
-        force_full_starkv_stack=is_starkv_kv(args.kv_cache),
         disable_starkv_extras_for_original=True,
     )
+
+    if is_starkv_kv(args.kv_cache) and (
+        args.kv_group_current_frame_mi_enable or args.kv_group_single_image_mi_enable
+    ):
+        parser.error("AndroidControl uses trajectory MI warmup/ramp; immediate-frame MI is incompatible")
 
     print(
         "[AndroidControl config]",
@@ -701,6 +816,8 @@ if __name__ == '__main__':
         print(f"Device validation error: {e}. Using CPU as fallback.")
         device = "cpu"
 
+    require_flash_attention_2(args, device)
+
     model_path = args.model_path
     print("model_path: ", model_path)
 
@@ -709,7 +826,9 @@ if __name__ == '__main__':
     #  e.g. min_pixels 3136 vs 100*28*28, breaking resize vs coordinate de-normalization in scoring.)
     eval_min_pixels, eval_max_pixels = MIN_PIXELS, MAX_PIXELS
     if "UI-TARS" in args.model_path:
-        processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=True, local_files_only=True, use_fast=False
+        )
         ip = getattr(processor, "image_processor", None)
         if ip is not None and getattr(ip, "min_pixels", None) is not None:
             eval_min_pixels = int(ip.min_pixels)
@@ -719,8 +838,12 @@ if __name__ == '__main__':
         )
         tokenizer = None  # Not needed for UI-TARS
     elif "opencua" in args.model_path.lower():
-        processor = AutoImageProcessor.from_pretrained(args.model_path, trust_remote_code=True)
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        processor = AutoImageProcessor.from_pretrained(
+            args.model_path, trust_remote_code=True, local_files_only=True, use_fast=False
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_path, trust_remote_code=True, local_files_only=True
+        )
     else:
         raise NotImplementedError(f"Model {args.model_path} not implemented")
         
@@ -765,6 +888,8 @@ if __name__ == '__main__':
             )
         set_attention_implementation(model, args)
         set_kv_cache_budget(model, args)
+        if is_compressed_kv(args.kv_cache):
+            set_kv_cache_mode(model, args)
         if args.attention_implementation == "eager":
             set_move_attention_to_cpu(model, args)
             # Configure accelerate to skip moving attention tensors back to GPU
@@ -796,6 +921,8 @@ if __name__ == '__main__':
             )
         set_attention_implementation(model, args)
         set_kv_cache_budget(model, args)
+        if is_compressed_kv(args.kv_cache):
+            set_kv_cache_mode(model, args)
         if args.attention_implementation == "eager":
             set_move_attention_to_cpu(model, args)
             # Configure accelerate to skip moving attention tensors back to GPU
@@ -803,8 +930,14 @@ if __name__ == '__main__':
 
     if is_starkv_kv(args.kv_cache):
         set_starkv_group_config(model, args)
-    apply_entropy_budget_runtime(model, args)
     reset_kv_cache_stats()
+    reset_gpu_memory_stats()
+    if getattr(args, "runtime_metrics", False):
+        reset_runtime_metrics()
+        RUNTIME_METRICS.set_warmup_samples(
+            int(os.environ.get("STARKV_RUNTIME_WARMUP_SAMPLES", "5"))
+        )
+        RUNTIME_METRICS.mark_run_start()
 
     print("Load Success")
 
@@ -823,42 +956,65 @@ if __name__ == '__main__':
     else:
         print("Num of sample: " + str(len(androidcontrol_data)))
 
-    # Chunk data for multi-GPU parallelism
-    if args.num_chunks > 1:
-        chunk_size = len(androidcontrol_data) // args.num_chunks
-        start = args.chunk_id * chunk_size
-        end = start + chunk_size if args.chunk_id < args.num_chunks - 1 else len(androidcontrol_data)
-        androidcontrol_data = androidcontrol_data[start:end]
-        print(f"Chunk {args.chunk_id}/{args.num_chunks}: {len(androidcontrol_data)} samples (indices {start}-{end-1})")
+    # Protocol v3: trajectory state must not leak or be cut at chunk boundaries.
+    androidcontrol_data = trajectory_samples(androidcontrol_data, args.chunk_id, args.num_chunks)
+    eval_fingerprint = protocol_fingerprint(androidcontrol_data, vars(args))
+    from collections import Counter
+    episode_sizes = Counter(episode_id(sample) for sample in androidcontrol_data)
+    print(f"[protocol] {PROTOCOL}: {len(androidcontrol_data)} samples, "
+          f"{len(episode_sizes)} whole episodes in chunk {args.chunk_id}/{args.num_chunks}")
+    if is_starkv_kv(args.kv_cache) and episode_sizes and max(episode_sizes.values()) <= args.kv_group_online_profile_steps:
+        print("[MI] No episode exceeds the profiling warmup; MI lambda will stay zero on this subset.")
 
     sample_details = []
-    session_stats = {"max_num_visual_spans": 1, "max_history_vision_tokens": 0}
-    episode_index = load_episode_index(args) if args.use_history_frames else None
+    session_stats = {
+        "max_num_visual_spans": 1,
+        "max_history_vision_tokens": 0,
+        "tem_layers_applied_max": 0,
+        "tem_reason_counts": {},
+        "paper_mi_layers_active_max": 0,
+        "paper_mi_topk_changed_max": 0,
+        "paper_mi_jaccard_sum": 0.0,
+        "paper_mi_jaccard_n": 0,
+        "paper_mi_spread_sum": 0.0,
+        "paper_mi_spread_n": 0,
+        "paper_mi_mode_counts": {},
+    }
+    episode_index = (
+        load_episode_index(args, samples=androidcontrol_data) if args.use_history_frames else None
+    )
     last_episode_id = None
 
-    # --- Checkpoint resume logic ---
+    # JSON checkpoints do not contain model state. Replay a partial episode
+    # rather than skipping its earlier calls and silently changing MI strength.
     if args.results_dir:
         latest_ckpt = _latest_checkpoint_path(args.results_dir)
         if latest_ckpt:
-            try:
-                with open(latest_ckpt, 'r') as f:
-                    ckpt = json.load(f)
-                restored = ckpt.get("num_samples_evaluated", 0)
-                if restored > 0:
-                    step_correctness = ckpt.get("step_correctness", step_correctness)
-                    sample_details = ckpt.get("sample_details", sample_details)
-                    print(f"[RESUME] Loaded checkpoint from {latest_ckpt} — {restored} samples already evaluated. Skipping to sample {restored}.")
-            except Exception as e:
-                print(f"[RESUME] Failed to load checkpoint {latest_ckpt}: {e}. Starting from scratch.")
-    
+            with open(latest_ckpt, encoding="utf-8") as f:
+                ckpt = json.load(f)
+            if ckpt.get("protocol") != PROTOCOL or ckpt.get("fingerprint") != eval_fingerprint:
+                raise SystemExit("Checkpoint protocol/data/config mismatch; use a fresh results directory")
+            restored = ckpt["num_samples_evaluated"]
+            if len(ckpt["step_correctness"]) != restored:
+                raise SystemExit("Checkpoint count does not match stored scores")
+            restart = resume_boundary(androidcontrol_data, restored)
+            step_correctness = ckpt["step_correctness"][:restart]
+            sample_details = [row for row in ckpt["sample_details"] if row["sample_idx"] < restart]
+            print(f"[RESUME] Keeping {restart} scores; replaying partial episode from its first evaluated step.")
+
     skip_n = len(step_correctness)
     for j, sample in tqdm(enumerate(androidcontrol_data[skip_n:], start=skip_n), desc=f"Processing data", total=len(androidcontrol_data), initial=skip_n):
+        current_episode_id = episode_id(sample)
+        if current_episode_id != last_episode_id:
+            if is_starkv_kv(args.kv_cache):
+                reset_starkv_per_sample_state(model, args)
+            last_episode_id = current_episode_id
+        _runtime_step_t0 = time.perf_counter()
+        _runtime_latency = None
         img_path = os.path.join(args.androidcontrol_imgs, sample['screenshot'])
         
         if not os.path.exists(img_path):
-            print("img not found: ", img_path)
-            step_correctness.append(0)
-            continue
+            raise FileNotFoundError(f"Missing evaluation screenshot: {img_path}")
         
         image = Image.open(img_path)
         # Resize oversized images to avoid vision attention OOM
@@ -875,8 +1031,26 @@ if __name__ == '__main__':
         low_level_task = sample["step_instruction"]
         previous_actions = sample.get("previous_actions", [])
         previous_actions_text = "\n".join(previous_actions)
+
+        # Inject history frames first so we only suppress text history when frames were used.
+        hist_steps_used = 0
+        if "UI-TARS" in args.model_path:
+            messages = [{"role": "system", "content": "You are a helpful assistant. "}]
+            hist_steps_used = _append_ac_history_messages(
+                messages, sample, episode_index, args, previous_actions
+            )
+        elif "opencua" in args.model_path.lower():
+            messages = []
+            if not getattr(args, "opencua_legacy_prompts", True):
+                messages.append({"role": "system", "content": "You are a GUI agent."})
+            hist_steps_used = _append_ac_history_messages(
+                messages, sample, episode_index, args, previous_actions
+            )
+        else:
+            raise NotImplementedError(f"Model {args.model_path} not implemented")
+
         # When GT history screenshots are in the chat, do not repeat the same text blob.
-        prompt_previous_actions = "" if args.use_history_frames else previous_actions_text
+        prompt_previous_actions = "" if hist_steps_used > 0 else previous_actions_text
 
         if args.instruction_level == "high":
             if "UI-TARS" in args.model_path:
@@ -895,36 +1069,13 @@ if __name__ == '__main__':
         else:
             raise ValueError(f"Invalid instruction level: {args.instruction_level}")
 
-        hist_steps_used = 0
-        if "UI-TARS" in args.model_path:
-            messages = [{"role": "system", "content": "You are a helpful assistant. "}]
-            hist_steps_used = _append_ac_history_messages(
-                messages, sample, episode_index, args, previous_actions
-            )
-            messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": img_path},
-                    {"type": "text", "text": user_prompt},
-                ],
-            })
-        elif "opencua" in args.model_path.lower():
-            messages = []
-            if not getattr(args, "opencua_legacy_prompts", True):
-                messages.append({"role": "system", "content": "You are a GUI agent."})
-            hist_steps_used = _append_ac_history_messages(
-                messages, sample, episode_index, args, previous_actions
-            )
-            messages.append({
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": img_path},
-                    {"type": "text", "text": user_prompt},
-                ],
-            })
-        else:
-            raise NotImplementedError(f"Model {args.model_path} not implemented")
-
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "image", "image": img_path},
+                {"type": "text", "text": user_prompt},
+            ],
+        })
         # Preparation for inference
         if "UI-TARS" in args.model_path:
             text = processor.apply_chat_template(
@@ -957,7 +1108,29 @@ if __name__ == '__main__':
             if not all_image_paths:
                 raise ValueError("No images found in OpenCUA messages")
 
-            images = [Image.open(p).convert("RGB") for p in all_image_paths]
+            # Optional efficiency-protocol cap is applied to every current/history
+            # image before OpenCUA vision preprocessing.  The previous resize of
+            # the local ``image`` object did not affect these path-reopened images.
+            proc_max_w = int(os.environ.get("STARKV_AC_PROCESSOR_MAX_W", "0") or 0)
+            proc_max_h = int(os.environ.get("STARKV_AC_PROCESSOR_MAX_H", "0") or 0)
+            images = []
+            for image_path in all_image_paths:
+                proc_image = Image.open(image_path).convert("RGB")
+                if proc_max_w > 0 and proc_max_h > 0 and (
+                    proc_image.width > proc_max_w or proc_image.height > proc_max_h
+                ):
+                    proc_ratio = min(
+                        proc_max_w / proc_image.width,
+                        proc_max_h / proc_image.height,
+                    )
+                    proc_image = proc_image.resize(
+                        (
+                            max(1, int(proc_image.width * proc_ratio)),
+                            max(1, int(proc_image.height * proc_ratio)),
+                        ),
+                        Image.LANCZOS,
+                    )
+                images.append(proc_image)
             info = processor.preprocess(images=images)
             pixel_values = torch.tensor(info["pixel_values"]).to(dtype=torch.bfloat16, device=model.device)
             grid_thws = torch.tensor(info["image_grid_thw"])
@@ -985,7 +1158,7 @@ if __name__ == '__main__':
         num_images = _count_message_images(messages)
         vision_analysis = None
 
-        need_vision_analysis = is_starkv_kv(args.kv_cache) or args.use_history_frames
+        need_vision_analysis = needs_vision_spans(args.kv_cache) or args.use_history_frames
         if need_vision_analysis:
             if "UI-TARS" in args.model_path:
                 vision_analysis = analyze_vision_tokens_multi_images(
@@ -1010,7 +1183,7 @@ if __name__ == '__main__':
         if args.use_history_frames and j < 3:
             print(
                 f"[history debug] sample={j} episode={sample.get('episode_id')} "
-                f"step={sample.get('step_index')} num_images={num_images} "
+                f"step={_ac_sample_step_index(sample)} num_images={num_images} "
                 f"hist_steps_used={hist_steps_used} "
                 f"history_limit={_ac_history_frame_limit(args)}"
             )
@@ -1025,33 +1198,39 @@ if __name__ == '__main__':
                 )
 
         set_window_size(model, args)
-        if is_starkv_kv(args.kv_cache):
-            set_vision_start_idx(model, vision_analysis['vision_start_idx'], args)
-            set_vision_end_idx(model, vision_analysis['vision_end_idx'], args)
+        if needs_vision_spans(args.kv_cache):
+            apply_vision_analysis_to_model(model, vision_analysis, args)
             if args.alpha is not None:
                 set_alpha(model, args)
                 set_temperature(model, args)
 
-        if is_starkv_kv(args.kv_cache):
-            ep_id = sample.get("episode_id")
-            if args.use_history_frames:
-                if ep_id != last_episode_id:
-                    reset_starkv_per_sample_state(model, args)
-                    last_episode_id = ep_id
-            else:
-                reset_starkv_per_sample_state(model, args)
+        # MI/TEM state persists across evaluated steps of the current episode.
 
         # OOM-safe generation with fallback
         output_text = ""
         try:
             if "UI-TARS" in args.model_path:
-                outputs = model.generate(**inputs, 
-                                        max_new_tokens=args.max_new_tokens, 
-                                        pad_token_id=processor.tokenizer.eos_token_id,
-                                        output_attentions=False,
-                                        use_cache=True,
-                                        do_sample=False,
-                                        return_dict_in_generate=True)
+                generate_kwargs = dict(
+                    **inputs,
+                    max_new_tokens=args.max_new_tokens,
+                    pad_token_id=processor.tokenizer.eos_token_id,
+                    output_attentions=False,
+                    use_cache=True,
+                    do_sample=False,
+                    return_dict_in_generate=True,
+                )
+                if getattr(args, "runtime_metrics", False):
+                    outputs, _ = timed_generate(
+                        model,
+                        synchronize_cuda=bool(
+                            getattr(args, "runtime_metrics_sync_cuda", True)
+                        ),
+                        record=False,
+                        **generate_kwargs,
+                    )
+                    _runtime_latency = _
+                else:
+                    outputs = model.generate(**generate_kwargs)
                 generated_ids = outputs if not hasattr(outputs, 'sequences') else outputs.sequences
                 generated_ids_trimmed = [
                     out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
@@ -1073,7 +1252,18 @@ if __name__ == '__main__':
                 )
                 if grid_thws is not None:
                     generate_kwargs["image_grid_thw"] = grid_thws
-                generated_ids = model.generate(**generate_kwargs)
+                if getattr(args, "runtime_metrics", False):
+                    generated_ids, _ = timed_generate(
+                        model,
+                        synchronize_cuda=bool(
+                            getattr(args, "runtime_metrics_sync_cuda", True)
+                        ),
+                        record=False,
+                        **generate_kwargs,
+                    )
+                    _runtime_latency = _
+                else:
+                    generated_ids = model.generate(**generate_kwargs)
                 
                 prompt_len = input_ids.shape[1]
                 generated_ids = generated_ids[:, prompt_len:]
@@ -1083,13 +1273,27 @@ if __name__ == '__main__':
                 print("output_text: ", output_text)
             else:
                 # Default to UI-TARS generation
-                outputs = model.generate(**inputs, 
-                                    max_new_tokens=args.max_new_tokens, 
-                                    pad_token_id=processor.tokenizer.eos_token_id,
-                                    output_attentions=False,
-                                    use_cache=True,
-                                    do_sample=False,
-                                    return_dict_in_generate=True)
+                generate_kwargs = dict(
+                    **inputs,
+                    max_new_tokens=args.max_new_tokens,
+                    pad_token_id=processor.tokenizer.eos_token_id,
+                    output_attentions=False,
+                    use_cache=True,
+                    do_sample=False,
+                    return_dict_in_generate=True,
+                )
+                if getattr(args, "runtime_metrics", False):
+                    outputs, _ = timed_generate(
+                        model,
+                        synchronize_cuda=bool(
+                            getattr(args, "runtime_metrics_sync_cuda", True)
+                        ),
+                        record=False,
+                        **generate_kwargs,
+                    )
+                    _runtime_latency = _
+                else:
+                    outputs = model.generate(**generate_kwargs)
                 
                 generated_ids = outputs if not hasattr(outputs, 'sequences') else outputs.sequences
                 
@@ -1102,6 +1306,11 @@ if __name__ == '__main__':
                 output_text = hf_output_text
                 print("output_text: ", output_text)
         except torch.cuda.OutOfMemoryError as oom_err:
+            if is_starkv_kv(args.kv_cache):
+                raise RuntimeError(
+                    "OOM interrupted trajectory state; resume from a protocol checkpoint "
+                    "to replay the partial episode instead of continuing with partial state"
+                ) from oom_err
             print(f"[OOM WARNING] Sample {j} ({img_path}) caused CUDA OOM. Skipping.")
             print(f"  Image size: {img_width}x{img_height}, Error: {oom_err}")
             if torch.cuda.is_available():
@@ -1117,6 +1326,92 @@ if __name__ == '__main__':
                 "skip_reason": "oom",
             })
             continue
+
+        if getattr(args, "runtime_metrics", False) and _runtime_latency is not None:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            try:
+                _input_tokens = int(
+                    inputs.input_ids.shape[-1]
+                    if "UI-TARS" in args.model_path else input_ids.shape[-1]
+                )
+            except Exception:
+                _input_tokens = None
+            RUNTIME_METRICS.record_sample(
+                _runtime_latency,
+                extra={
+                    "step_e2e_s": round(time.perf_counter() - _runtime_step_t0, 6),
+                    "num_images": int(num_images),
+                    "history_frames": int(hist_steps_used),
+                    "input_tokens": _input_tokens,
+                },
+            )
+
+        if is_starkv_kv(args.kv_cache) and bool(getattr(args, "kv_group_temporal_enable", False)):
+            try:
+                tem_diag = collect_temporal_diagnostics_from_model(model, args.model_path)
+                session_stats["tem_layers_applied_max"] = max(
+                    session_stats["tem_layers_applied_max"],
+                    int(tem_diag.get("tem_layers_applied", 0) or 0),
+                )
+                for reason, cnt in (tem_diag.get("tem_reason_counts") or {}).items():
+                    session_stats["tem_reason_counts"][reason] = (
+                        session_stats["tem_reason_counts"].get(reason, 0) + int(cnt)
+                    )
+                if j < 3:
+                    print(
+                        f"[TEM debug] sample={j} layers_applied={tem_diag.get('tem_layers_applied')} "
+                        f"reasons={tem_diag.get('tem_reason_counts')}"
+                    )
+            except Exception as tem_err:
+                if j < 3:
+                    print(f"[TEM debug] sample={j} collect failed: {tem_err}")
+
+        paper_mi_on = (
+            is_starkv_kv(args.kv_cache)
+            and float(getattr(args, "kv_group_soft_prior_lambda", 0.0) or 0.0) > 0.0
+        )
+        if paper_mi_on:
+            try:
+                mi_diag = collect_original_mi_diagnostics_from_model(model, args.model_path)
+                session_stats["paper_mi_layers_active_max"] = max(
+                    session_stats["paper_mi_layers_active_max"],
+                    int(mi_diag.get("mi_layers_active", 0) or 0),
+                )
+                session_stats["paper_mi_topk_changed_max"] = max(
+                    session_stats["paper_mi_topk_changed_max"],
+                    int(mi_diag.get("mi_layers_pre_sfr_topk_changed", 0) or 0),
+                )
+                for mode, cnt in (mi_diag.get("mi_mode_counts") or {}).items():
+                    session_stats["paper_mi_mode_counts"][mode] = (
+                        session_stats["paper_mi_mode_counts"].get(mode, 0) + int(cnt)
+                    )
+                jaccards = []
+                spreads = []
+                for row in (mi_diag.get("mi_by_layer") or {}).values():
+                    jj = row.get("pre_sfr_topk_jaccard")
+                    if jj is not None:
+                        jaccards.append(float(jj))
+                    sp = row.get("group_weight_spread")
+                    if sp is not None:
+                        spreads.append(float(sp))
+                if jaccards:
+                    session_stats["paper_mi_jaccard_sum"] += sum(jaccards) / len(jaccards)
+                    session_stats["paper_mi_jaccard_n"] += 1
+                if spreads:
+                    session_stats["paper_mi_spread_sum"] += sum(spreads) / len(spreads)
+                    session_stats["paper_mi_spread_n"] += 1
+                if j < 3:
+                    mean_j = (sum(jaccards) / len(jaccards)) if jaccards else None
+                    mean_s = (sum(spreads) / len(spreads)) if spreads else None
+                    print(
+                        f"[paper-MI debug] sample={j} active={mi_diag.get('mi_layers_active')} "
+                        f"topk_changed={mi_diag.get('mi_layers_pre_sfr_topk_changed')} "
+                        f"modes={mi_diag.get('mi_mode_counts')} mean_jaccard={mean_j} mean_spread={mean_s}"
+                    )
+            except Exception as mi_err:
+                if j < 3:
+                    print(f"[paper-MI debug] sample={j} collect failed: {mi_err}")
 
         sample_idx = androidcontrol_data.index(sample)
 
@@ -1413,18 +1708,33 @@ if __name__ == '__main__':
         print("gt_action_type: ", gt_action_type, "gt_action", gt_action)
         print("correct_step: ", correct_step)
         step_correctness.append(correct_step)
+        sample_details.append({
+            "sample_idx": j,
+            "sample_id": j,
+            "episode_id": sample.get("episode_id"),
+            "step_id": _ac_sample_step_index(sample),
+            "img_path": img_path,
+            "goal": goal,
+            "output_text": output_text,
+            "step_correct": int(correct_step),
+            "skipped": False,
+        })
         
         # Periodic checkpoint: save intermediate results every 50 samples
         if len(step_correctness) % 50 == 0 and args.results_dir:
             os.makedirs(args.results_dir, exist_ok=True)
             checkpoint = {
+                "schema_version": 3,
+                "protocol": PROTOCOL,
+                "fingerprint": eval_fingerprint,
                 "num_samples_evaluated": len(step_correctness),
                 "step_correctness": step_correctness,
                 "sample_details": sample_details,
             }
             ckpt_path = os.path.join(args.results_dir, f"checkpoint_{len(step_correctness)}.json")
-            with open(ckpt_path, 'w') as f:
+            with open(ckpt_path + ".tmp", 'w') as f:
                 json.dump(checkpoint, f, indent=2, ensure_ascii=False)
+            os.replace(ckpt_path + ".tmp", ckpt_path)
             print(f"[CHECKPOINT] Saved intermediate results to {ckpt_path}")
         
     step_accuracy = np.mean(step_correctness) if step_correctness else 0.0
@@ -1468,27 +1778,28 @@ if __name__ == '__main__':
     if args.results_dir:
         os.makedirs(args.results_dir, exist_ok=True)
 
+        runtime_metrics_summary = None
+        if getattr(args, "runtime_metrics", False):
+            RUNTIME_METRICS.mark_run_end()
+            runtime_metrics_summary = collect_runtime_metrics()
+
         try:
             gpu_stats = collect_gpu_memory_stats()
         except Exception:
             gpu_stats = {}
-        try:
-            ent_stats = collect_entropy_budget_stats(model, args)
-        except Exception:
-            ent_stats = {}
         duration_s = time.time() - eval_start_time
 
         # Keep legacy detailed results
         detailed_results = {
+            "schema_version": 3,
+            "protocol": PROTOCOL,
+            "fingerprint": eval_fingerprint,
             "model_family": "opencua" if "opencua" in args.model_path.lower() else "uitars",
             "model_path": args.model_path,
             "dataset": args.dataset_file,
             "kv_cache": args.kv_cache,
             "kv_cache_budget": args.kv_cache_budget,
-            "kv_group_temporal_enable": bool(getattr(args, "kv_group_temporal_enable", False)),
-            "kv_group_temporal_mode": getattr(args, "kv_group_temporal_mode", "exponential"),
-            "kv_group_temporal_gamma": getattr(args, "kv_group_temporal_gamma", 1.0),
-            "attention_implementation": args.attention_implementation,
+            "kv_group_temporal_enable": bool(getattr(args, "kv_group_temporal_enable", False)),            "attention_implementation": args.attention_implementation,
             "model_dtype": args.model_dtype,
                         "chunk_start_idx": getattr(args, "chunk_start_idx", 0) if "start_idx" in dir() else 0,
             "chunk_end_idx": getattr(args, "chunk_end_idx", 0) if "end_idx" in dir() else 0,
@@ -1498,6 +1809,25 @@ if __name__ == '__main__':
             "max_num_visual_spans_seen": session_stats["max_num_visual_spans"],
             "max_history_vision_tokens_seen": session_stats["max_history_vision_tokens"],
             "max_history_steps_used": session_stats.get("max_history_steps_used", 0),
+            "tem_layers_applied_max": session_stats.get("tem_layers_applied_max", 0),
+            "tem_reason_counts": session_stats.get("tem_reason_counts", {}),
+            "paper_mi_layers_active_max": session_stats.get("paper_mi_layers_active_max", 0),
+            "paper_mi_topk_changed_max": session_stats.get("paper_mi_topk_changed_max", 0),
+            "paper_mi_mean_jaccard_vs_base": (
+                (session_stats["paper_mi_jaccard_sum"] / session_stats["paper_mi_jaccard_n"])
+                if session_stats.get("paper_mi_jaccard_n", 0) else None
+            ),
+            "paper_mi_mean_group_weight_spread": (
+                (session_stats["paper_mi_spread_sum"] / session_stats["paper_mi_spread_n"])
+                if session_stats.get("paper_mi_spread_n", 0) else None
+            ),
+            "paper_mi_mode_counts": session_stats.get("paper_mi_mode_counts", {}),
+            "kv_group_soft_prior_lambda": getattr(args, "kv_group_soft_prior_lambda", None),
+            "kv_group_current_frame_mi_enable": bool(
+                getattr(args, "kv_group_current_frame_mi_enable", False)
+            ),
+            "alpha": getattr(args, "alpha", None),
+            "kv_group_temporal_delta": getattr(args, "kv_group_temporal_delta", None),
             "metrics": androidcontrol_metrics,
             "debug": args.debug is not None,
             "num_samples_evaluated": len(step_correctness),
@@ -1506,6 +1836,8 @@ if __name__ == '__main__':
             "duration_s": duration_s,
             "peak_alloc_GB": gpu_stats.get("peak_allocated_gb", 0) if gpu_stats else 0,
             "peak_reserved_GB": gpu_stats.get("peak_reserved_gb", 0) if gpu_stats else 0,
+            "step_correctness": step_correctness,
+            "sample_details": sample_details,
         }
         chunk_suffix = f"_chunk{args.chunk_id}of{args.num_chunks}" if args.num_chunks > 1 else ""
         results_filename = f'androidcontrol_results_budget{args.kv_cache_budget}{chunk_suffix}.json'
@@ -1514,8 +1846,11 @@ if __name__ == '__main__':
             json.dump(detailed_results, f, indent=2, ensure_ascii=False)
 
         summary = {
+            "schema_version": 3,
+            "protocol": PROTOCOL,
+            "fingerprint": eval_fingerprint,
             "model_family": "opencua" if "opencua" in args.model_path.lower() else "uitars",
-            "method": "starkv" if is_starkv_kv(args.kv_cache) else args.kv_cache,
+            "method": args.kv_cache,
             "kv_cache": args.kv_cache,
             "budget": args.kv_cache_budget,
             "performance": {
@@ -1530,16 +1865,25 @@ if __name__ == '__main__':
                 "max_num_visual_spans_seen": session_stats["max_num_visual_spans"],
                 "max_history_vision_tokens_seen": session_stats["max_history_vision_tokens"],
                 "max_history_steps_used": session_stats.get("max_history_steps_used", 0),
+                "processor_max_width": int(os.environ.get("STARKV_AC_PROCESSOR_MAX_W", "0") or 0),
+                "processor_max_height": int(os.environ.get("STARKV_AC_PROCESSOR_MAX_H", "0") or 0),
             },
             "efficiency": {
                 "duration_s": duration_s,
+                "steps_per_s_e2e": (
+                    len(step_correctness) / duration_s if duration_s > 0 else None
+                ),
                 "peak_alloc_GB": gpu_stats.get("peak_allocated_gb", 0) if gpu_stats else 0,
                 "peak_reserved_GB": gpu_stats.get("peak_reserved_gb", 0) if gpu_stats else 0,
+                "num_oom_samples": sum(
+                    1 for row in sample_details
+                    if row.get("skipped") and row.get("skip_reason") == "oom"
+                ),
+                "runtime_metrics": runtime_metrics_summary,
             },
             "debug": {
                 "starkv_debug": None,
                 "temporal_debug": None,
-                "entropy_budget_debug": ent_stats,
                 "token_dynamics_debug": None,
                 "kv_cache_stats": compute_kv_cache_memory_summary(collect_kv_cache_stats()),
             },
@@ -1547,12 +1891,6 @@ if __name__ == '__main__':
                 "starkv_enabled": is_starkv_kv(getattr(args, "kv_cache", None)),
                 "temporal_enabled": bool(getattr(args, "kv_group_temporal_enable", False)),
                 "temporal_active": bool(getattr(args, "kv_group_temporal_enable", False)),
-                "aeb_mode": (
-                    "fixed_score"
-                    if bool(getattr(args, "kv_entropy_budget_enable", False))
-                    else "none"
-                ),
-                "pre_aeb_score_available": True,
                 "final_score_used_for_compression": True,
                 "policy": "eviction_only",
             },

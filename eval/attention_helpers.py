@@ -1,6 +1,7 @@
 import argparse
+import importlib.util
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
@@ -12,6 +13,71 @@ logger = logging.get_logger(__name__)
 
 # Fused attention backends (sdpa / flash_attention_2): GQA expand + compressed-KV mask quirks.
 _ATTN_FUSED_BACKENDS = frozenset({"sdpa", "flash_attention_2"})
+FLASH_ATTENTION_2 = "flash_attention_2"
+
+
+def add_flash_attention_2_argument(parser: argparse.ArgumentParser) -> None:
+    """Register the only attention backend allowed by official evaluations."""
+    parser.add_argument(
+        "--attention_implementation",
+        type=str,
+        default=FLASH_ATTENTION_2,
+        choices=[FLASH_ATTENTION_2],
+        help="Official evaluations require FlashAttention2; fallback backends are forbidden.",
+    )
+
+
+def require_flash_attention_2(args, device) -> None:
+    """Fail closed instead of silently mixing eager/SDPA with FA2 results."""
+    impl = getattr(args, "attention_implementation", None)
+    if impl != FLASH_ATTENTION_2:
+        raise SystemExit(
+            f"Official evaluation requires {FLASH_ATTENTION_2!r}; got {impl!r}. "
+            "eager/SDPA results are not comparable."
+        )
+    device_type = str(device).split(":", 1)[0]
+    if device_type != "cuda" or not torch.cuda.is_available():
+        raise SystemExit(
+            "flash_attention_2 requires an available CUDA device; "
+            f"selected device={device!r}, cuda_available={torch.cuda.is_available()}."
+        )
+    if importlib.util.find_spec("flash_attn") is None:
+        raise SystemExit(
+            "flash_attention_2 was requested but the flash_attn package is not installed. "
+            "Fallback to eager/SDPA is forbidden."
+        )
+    print("[attention backend] flash_attention_2 (required, fallback disabled)", flush=True)
+
+
+def _fit_fa2_mask_to_compressed_kv(
+    attention_mask: Optional[torch.Tensor], key_states: torch.Tensor
+) -> Optional[torch.Tensor]:
+    """Match a 2-D FA2 padding mask to the physical compressed-cache length.
+
+    Hugging Face generation keeps the logical, uncompressed sequence length in
+    its padding mask. After KV compression, FA2's unpadding code indexes the
+    physical K/V tensor with that mask, so a longer mask causes a CUDA index
+    OOB. Compression only removes historical tokens; retaining the rightmost
+    ``kv_len`` mask entries preserves the recent/decode suffix and is exact for
+    the batch-size-one, unpadded official evaluations.
+    """
+    if attention_mask is None:
+        return None
+    if attention_mask.ndim != 2:
+        raise ValueError(
+            "flash_attention_2 compressed KV requires a 2-D padding mask; "
+            f"got shape={tuple(attention_mask.shape)}"
+        )
+    kv_len = int(key_states.shape[-2])
+    mask_len = int(attention_mask.shape[-1])
+    if mask_len < kv_len:
+        raise ValueError(
+            "flash_attention_2 padding mask is shorter than compressed KV: "
+            f"mask_len={mask_len}, kv_len={kv_len}"
+        )
+    if mask_len > kv_len:
+        attention_mask = attention_mask[:, -kv_len:].contiguous()
+    return attention_mask
 
 
 def _attn_is_fused_backend(attn_impl: Optional[str]) -> bool:
@@ -25,14 +91,45 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 
 import transformers
 import sys
-sys.path.append('../starkv')
+sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parents[1]))
 
-from starkv_utils import init_starkv
+from starkv.starkv_utils import init_starkv
+from runtime_metrics import (
+    RUNTIME_METRICS,
+    CudaTimer,
+    collect_runtime_metrics,
+    reset_runtime_metrics,
+    timed_generate,
+)
+
+
+def call_update_kv(cluster, key_states, query_states, value_states,
+                   attention_mask, num_key_value_groups, hidden_states=None):
+    """Call the sole compressor, optionally timing it for evaluation."""
+    parent = getattr(cluster, "attn_parent", None)
+    args = (key_states, query_states, value_states, attention_mask,
+            num_key_value_groups, hidden_states)
+    if not getattr(parent, "kv_runtime_metrics_enable", False):
+        return cluster.update_kv(*args)
+    with CudaTimer(use_cuda_events=bool(getattr(parent, "kv_runtime_metrics_cuda_events", False))) as timer:
+        result = cluster.update_kv(*args)
+    RUNTIME_METRICS.record_compress_timing(timer.wall_ms)
+    return result
 
 
 def is_starkv_kv(kv_cache_mode):
-    """True when using STaR-KV compression (STARKVGroupCluster)."""
+    """True when using STaR-KV compression (STARKVGroupCluster + MI/TEM/SFR)."""
     return kv_cache_mode == "starkv"
+
+
+def is_compressed_kv(kv_cache_mode):
+    """True only for the canonical STaR-KV compressor."""
+    return is_starkv_kv(kv_cache_mode)
+
+
+def needs_vision_spans(kv_cache_mode):
+    """True when STaR-KV requires vision token span indices."""
+    return is_starkv_kv(kv_cache_mode)
 
 
 
@@ -154,22 +251,45 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 
-def unrepeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+def apply_paper_kv_budget(config, kv_seq_len: int, budget_pct: float, window_size: int):
+    """Allocate a total prefill KV capacity that includes the recent window.
+
+    C = max(1, floor(sequence_length * budget_pct / 100)), capped at the
+    sequence length. The effective window is min(requested_window, C),
+    and SFR selects B = C - window historical tokens (possibly zero).
     """
-    Undo repeat_kv
+    seq = int(kv_seq_len)
+    pct = float(budget_pct)
+    win = int(window_size)
+    if seq < 1 or not 0.0 < pct <= 100.0 or win < 1:
+        raise ValueError("KV budget requires length >= 1, 0 < percent <= 100, window >= 1")
+    capacity = min(seq, max(1, int(seq * (pct / 100.0))))
+    win = min(win, capacity)
+    hist_b = capacity - win
+    config.kv_historical_budget = hist_b
+    config.window_size = win
+    config.max_capacity_prompt = capacity
+    return hist_b, win
+
+
+def unrepeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """Collapse expanded GQA replicas back to native ``num_kv_heads``.
+
+    ``repeat_kv`` duplicates each KV head ``n_rep`` times. Prefer compressors
+    that already return native ``num_kv_heads`` (STaR-KV shared indices).
+    This helper is a safety net when outputs are still expanded: it keeps the first
+    replica per group (valid when all replicas share the same keep set).
     """
     batch, num_attention_heads, slen, head_dim = hidden_states.shape
     if n_rep == 1:
         return hidden_states.contiguous()
-    
-    # Reshape from (batch, num_attention_heads, slen, head_dim) 
-    # to (batch, num_key_value_heads, n_rep, slen, head_dim)
+    if num_attention_heads % n_rep != 0:
+        raise ValueError(
+            f"Cannot unrepeat_kv: num_attention_heads={num_attention_heads} not divisible by n_rep={n_rep}"
+        )
     num_key_value_heads = num_attention_heads // n_rep
     hidden_states = hidden_states.reshape(batch, num_key_value_heads, n_rep, slen, head_dim)
-    
-    # Take only the first repetition to get back the original
-    # (batch, num_key_value_heads, slen, head_dim)
-    return hidden_states[:, :, 0, :, :].contiguous()
+    return hidden_states[:, :, 0].contiguous()
 
 def eager_attention_forward(
     module: nn.Module,
@@ -400,7 +520,6 @@ def qwen2_5_vl_attention_forward_STARKV(
     if q_len > 1:
         self.kv_seq_len = 0
 
-    used_compressed_kv = False
     if past_key_value is not None:
         if self.layer_idx is None:
             raise ValueError(
@@ -420,33 +539,62 @@ def qwen2_5_vl_attention_forward_STARKV(
     query_states, key_states = apply_multimodal_rotary_pos_emb(
         query_states, key_states, cos, sin, _qwen25vl_mrope_section(self)
     )
-    key_states = repeat_kv(key_states, self.num_key_value_groups)
-    value_states = repeat_kv(value_states, self.num_key_value_groups)
+    # Keep native GQA KV-head layout for cache writes (same as HF full-cache).
+    # Only expand temporarily when the compressor expects query-head K/V.
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
 
-        self.config.max_capacity_prompt = int(kv_seq_len * (self.kv_cache_budget / 100))
-        self.config.window_size = max(1, min(self.config.window_size, self.config.max_capacity_prompt - 2))
+        apply_paper_kv_budget(
+            self.config,
+            kv_seq_len,
+            self.kv_cache_budget,
+            getattr(self, "kv_window_size", getattr(self.config, "window_size", 32)),
+        )
         if hasattr(self, "vision_start_idx"):
             self.config.vision_start_idx = self.vision_start_idx
         if hasattr(self, "vision_end_idx"):
             self.config.vision_end_idx = self.vision_end_idx
+        if hasattr(self, "vision_token_grids"):
+            self.config.vision_token_grids = self.vision_token_grids
+        if hasattr(self, "vision_spans"):
+            self.config.vision_spans = self.vision_spans
         init_starkv(self)
-        # propagate AEB settings to STARKVGroupCluster via attn_parent
-        self.kv_cluster.kv_entropy_budget_enable = getattr(self, "kv_entropy_budget_enable", False)
-        self.kv_cluster.kv_entropy_budget_min_scale = getattr(self, "kv_entropy_budget_min_scale", 0.5)
-        self.kv_cluster.kv_entropy_budget_max_scale = getattr(self, "kv_entropy_budget_max_scale", 1.5)
-        self.kv_cluster.kv_entropy_budget_smooth = getattr(self, "kv_entropy_budget_smooth", 0.0)
-        self.kv_cluster.kv_entropy_budget_scope = getattr(self, "kv_entropy_budget_scope", "layer")
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states, query_states, value_states, attention_mask, self.num_key_value_groups, hidden_states
+            key_states_for_update = (
+                repeat_kv(key_states, self.num_key_value_groups)
+                if key_states.shape[1] != query_states.shape[1]
+                else key_states
+            )
+            value_states_for_update = (
+                repeat_kv(value_states, self.num_key_value_groups)
+                if value_states.shape[1] != query_states.shape[1]
+                else value_states
+            )
+            key_states_compress, value_states_compress = call_update_kv(
+                self.kv_cluster,
+                key_states_for_update,
+                query_states,
+                value_states_for_update,
+                attention_mask,
+                self.num_key_value_groups,
+                hidden_states,
             )
             self.kept_indices = getattr(self.kv_cluster, "kept_indices", None)
+            # Collapse back to native KV heads before writing cache.
+            if key_states_compress.shape[1] != key_states.shape[1]:
+                key_states_compress = unrepeat_kv(key_states_compress, self.num_key_value_groups)
+                value_states_compress = unrepeat_kv(value_states_compress, self.num_key_value_groups)
+            key_states_compress = key_states_compress.contiguous()
+            value_states_compress = value_states_compress.contiguous()
             past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
-            used_compressed_kv = True
-            _record_kv_cache(self.layer_idx, kv_seq_len, key_states_compress.shape[-2])
+            _record_kv_cache(
+                self.layer_idx,
+                kv_seq_len,
+                key_states_compress.shape[-2],
+                key_tensor=key_states_compress,
+                value_tensor=value_states_compress,
+            )
         else:
             self.kv_seq_len += q_len
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
@@ -456,30 +604,17 @@ def qwen2_5_vl_attention_forward_STARKV(
     if self.config._attn_implementation != "eager":
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
-    attention_mask_for_compute = attention_mask
-    if _attn_is_fused_backend(self.config._attn_implementation) and used_compressed_kv:
-        attention_mask_for_compute = None
-
-    num_key_value_groups_backup = None
-    if _attn_is_fused_backend(self.config._attn_implementation):
-        num_key_value_groups_backup = self.num_key_value_groups
-        self.num_key_value_groups = 1
-
-    try:
-        attn_output, attn_weights = attention_interface(
-            self,
-            query_states,
-            key_states,
-            value_states,
-            attention_mask_for_compute,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
-            sliding_window=None,
-            **kwargs,
-        )
-    finally:
-        if num_key_value_groups_backup is not None:
-            self.num_key_value_groups = num_key_value_groups_backup
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=None,
+        **kwargs,
+    )
 
     if attn_weights is not None and self.move_attention_to_cpu:
         attn_weights = attn_weights.detach().cpu()
@@ -489,7 +624,7 @@ def qwen2_5_vl_attention_forward_STARKV(
     return attn_output, attn_weights, past_key_value
 
 
-# --- STaR-KV (Qwen2 / OpenCUA) ---
+# --- STaR-KV compressed KV (Qwen2 / OpenCUA) ---
 
 
 def qwen2_attention_forward_STARKV(
@@ -533,30 +668,32 @@ def qwen2_attention_forward_STARKV(
     cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
 
-        self.config.max_capacity_prompt = int(kv_seq_len * (self.kv_cache_budget / 100))
-
-        self.config.window_size = min(self.config.window_size, self.config.max_capacity_prompt - 2)
+        apply_paper_kv_budget(
+            self.config,
+            kv_seq_len,
+            self.kv_cache_budget,
+            getattr(self, "kv_window_size", getattr(self.config, "window_size", 32)),
+        )
         if hasattr(self, "vision_start_idx"):
             self.config.vision_start_idx = self.vision_start_idx
         if hasattr(self, "vision_end_idx"):
             self.config.vision_end_idx = self.vision_end_idx
+        if hasattr(self, "vision_token_grids"):
+            self.config.vision_token_grids = self.vision_token_grids
+        if hasattr(self, "vision_spans"):
+            self.config.vision_spans = self.vision_spans
         init_starkv(self)
-        # propagate AEB settings to STARKVGroupCluster via attn_parent
-        self.kv_cluster.kv_entropy_budget_enable = getattr(self, "kv_entropy_budget_enable", False)
-        self.kv_cluster.kv_entropy_budget_min_scale = getattr(self, "kv_entropy_budget_min_scale", 0.5)
-        self.kv_cluster.kv_entropy_budget_max_scale = getattr(self, "kv_entropy_budget_max_scale", 1.5)
-        self.kv_cluster.kv_entropy_budget_smooth = getattr(self, "kv_entropy_budget_smooth", 0.0)
-        self.kv_cluster.kv_entropy_budget_scope = getattr(self, "kv_entropy_budget_scope", "layer")
-
         if key_states.shape[-2] == kv_seq_len:
             self.kv_seq_len = kv_seq_len
             # Temporarily repeat KV for update_kv which expects num_heads
             key_states_for_update = repeat_kv(key_states, self.num_key_value_groups) if key_states.shape[1] != query_states.shape[1] else key_states
             value_states_for_update = repeat_kv(value_states, self.num_key_value_groups) if value_states.shape[1] != query_states.shape[1] else value_states
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+            key_states_compress, value_states_compress = call_update_kv(
+                self.kv_cluster,
                 key_states_for_update,
                 query_states,
                 value_states_for_update,
@@ -565,11 +702,20 @@ def qwen2_attention_forward_STARKV(
                 hidden_states,
             )
             self.kept_indices = getattr(self.kv_cluster, "kept_indices", None)
-            key_states_compress = unrepeat_kv(key_states_compress, self.num_key_value_groups)
-            value_states_compress = unrepeat_kv(value_states_compress, self.num_key_value_groups)
-            key_states_compress = key_states_compress.contiguous(); value_states_compress = value_states_compress.contiguous()
+            # Collapse only if compressor still returned expanded query-head layout.
+            if key_states_compress.shape[1] != key_states.shape[1]:
+                key_states_compress = unrepeat_kv(key_states_compress, self.num_key_value_groups)
+                value_states_compress = unrepeat_kv(value_states_compress, self.num_key_value_groups)
+            key_states_compress = key_states_compress.contiguous()
+            value_states_compress = value_states_compress.contiguous()
             past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
-            _record_kv_cache(self.layer_idx, kv_seq_len, key_states_compress.shape[-2])
+            _record_kv_cache(
+                self.layer_idx,
+                kv_seq_len,
+                key_states_compress.shape[-2],
+                key_tensor=key_states_compress,
+                value_tensor=value_states_compress,
+            )
         else:
             self.kv_seq_len += q_len
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
@@ -578,6 +724,9 @@ def qwen2_attention_forward_STARKV(
     attention_interface: Callable = eager_attention_forward
     if self.config._attn_implementation != "eager":
         attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
+
+    if self.config._attn_implementation == FLASH_ATTENTION_2:
+        attention_mask = _fit_fa2_mask_to_compressed_kv(attention_mask, key_states)
 
     attn_output, attn_weights = attention_interface(
         self,
@@ -715,193 +864,132 @@ def set_kv_cache_budget(model, args):
         raise NotImplementedError("Model not supported")
 
 
-def apply_entropy_budget_runtime(model, args):
-    """Inject AEB (Attention Entropy Budgeting) settings into every self-attention layer.
-
-    AEB is designed as an internal module of the STaR-KV framework and only activates
-    when kv_cache is starkv. For original mode, settings are ignored.
-    """
-    enable = bool(getattr(args, "kv_entropy_budget_enable", False))
-    kv_cache = getattr(args, "kv_cache", None)
-    if not enable:
-        return
-    if not is_starkv_kv(kv_cache):
-        return
+def set_kv_cache_mode(model, args):
+    """Stamp --kv_cache mode onto every attention layer for cluster dispatch."""
+    mode = getattr(args, "kv_cache", "original")
     if "UI-TARS" in args.model_path:
         layers = model.model.language_model.layers
     elif "OpenCUA" in args.model_path:
-        layers = model.language_model.model.layers
-    else:
-        return
-    for layer in layers:
-        sa = layer.self_attn
-        sa.kv_entropy_budget_enable = enable
-        sa.kv_entropy_budget_min_scale = float(getattr(args, "kv_entropy_budget_min_scale", 0.5))
-        sa.kv_entropy_budget_max_scale = float(getattr(args, "kv_entropy_budget_max_scale", 1.5))
-        sa.kv_entropy_budget_smooth = float(getattr(args, "kv_entropy_budget_smooth", 0.0))
-        sa.kv_entropy_budget_scope = str(getattr(args, "kv_entropy_budget_scope", "layer"))
-
-
-def reset_starkv_per_sample_state(model, args):
-    """Reset all per-sample STaR-KV EMA states before each model.generate() call.
-
-    Resets:
-    - Online profiling: step=0, mi_ema=None
-    - Temporal: step=0, pattern_ema=None, last_stats={}
-    - AEB temperature EMA (if enabled)
-    """
-    if not is_starkv_kv(getattr(args, "kv_cache", None)):
-        return
-    if "UI-TARS" in args.model_path:
-        layers = model.model.language_model.layers
-    elif "OpenCUA" in args.model_path:
-        layers = model.language_model.model.layers
-    else:
-        return
-    for layer in layers:
-        sa = layer.self_attn
-        # Online profiling
-        sa.kv_group_online_profile_step = 0
-        sa.kv_group_online_profile_mi_ema = None
-        # Temporal
-        if getattr(args, "kv_group_temporal_enable", False):
-            sa.kv_group_temporal_step = 0
-            sa.kv_group_temporal_pattern_ema = None
-            sa.kv_group_temporal_last_stats = {}
-        # AEB temperature EMA reset
-        if getattr(args, "kv_entropy_budget_enable", False):
-            if hasattr(sa, "_aeb_temperature_ema"):
-                sa._aeb_temperature_ema = None
-
-
-def set_starkv_group_config(model, args):
-    """Propagate STARKVGroup / AEB / Temporal config to all attention layers."""
-    if args.model_path == "ByteDance-Seed/UI-TARS-1.5-7B" or "ui-tars" in args.model_path.lower():
-        layers = model.model.language_model.layers
-    elif args.model_path == "xlangai/OpenCUA-7B" or "opencua" in args.model_path.lower():
         layers = model.language_model.model.layers
     else:
         raise NotImplementedError("Model not supported")
+    for layer in layers:
+        layer.self_attn.kv_cache_mode = mode
+        layer.self_attn.baseline_gqa_mode = getattr(
+            args, "baseline_gqa_mode", "group_mean"
+        )
+        layer.self_attn.kv_budget_semantics = getattr(
+            args, "kv_budget_semantics", "total_including_window"
+        )
 
-    mi_granularity = getattr(args, "kv_group_mi_granularity", "gqa_group")
-    if mi_granularity not in ("gqa_group", "mha_head"):
-        mi_granularity = "gqa_group"
-
+def reset_starkv_per_sample_state(model, args):
+    """Reset canonical MI, TEM, and SFR state before an independent sample."""
+    if not is_starkv_kv(getattr(args, "kv_cache", None)):
+        return
+    layers = iter_language_model_layers(model, getattr(args, "model_path", ""))
+    if not layers:
+        return
     for layer in layers:
         sa = layer.self_attn
-        sa.kv_group_selection_mode = "soft_global"
-        sa.config.kv_group_selection_mode = "soft_global"
-        sa.kv_group_mi_granularity = mi_granularity
-        sa.config.kv_group_mi_granularity = mi_granularity
-        # AEB (fixed_score: entropy only scales scores, not budget)
-        sa.kv_entropy_budget_enable = bool(getattr(args, "kv_entropy_budget_enable", False))
-        sa.kv_entropy_budget_min_scale = float(getattr(args, "kv_entropy_budget_min_scale", 0.95))
-        sa.kv_entropy_budget_max_scale = float(getattr(args, "kv_entropy_budget_max_scale", 1.05))
-        sa.kv_entropy_budget_smooth = float(getattr(args, "kv_entropy_budget_smooth", 0.0))
-        sa.kv_entropy_budget_scope = str(getattr(args, "kv_entropy_budget_scope", "layer"))
-        # Soft-global MI prior
-        sa.kv_group_soft_prior_lambda = float(getattr(args, "kv_group_soft_prior_lambda", 0.5))
-        sa.kv_group_soft_prior_source = str(getattr(args, "kv_group_soft_prior_source", "mi_saliency"))
-        sa.kv_group_mi_saliency_weight = float(getattr(args, "kv_group_mi_saliency_weight", 0.5))
-        sa.config.kv_group_soft_prior_source = sa.kv_group_soft_prior_source
-        sa.config.kv_group_mi_saliency_weight = sa.kv_group_mi_saliency_weight
-        # Online MI profiling (EMA ramp for λ_eff)
-        sa.kv_group_online_profile_steps = int(getattr(args, "kv_group_online_profile_steps", 5))
-        sa.kv_group_online_profile_decay = float(getattr(args, "kv_group_online_profile_decay", 0.9))
-        sa.kv_group_online_profile_tau = float(getattr(args, "kv_group_online_profile_tau", 1.0))
-        sa.kv_group_online_profile_lambda_ramp_steps = int(
-            getattr(args, "kv_group_online_profile_lambda_ramp_steps", sa.kv_group_online_profile_steps)
-        )
         sa.kv_group_online_profile_step = 0
         sa.kv_group_online_profile_mi_ema = None
-        # Temporal discount
-        sa.kv_group_temporal_enable = bool(getattr(args, "kv_group_temporal_enable", False))
-        sa.kv_group_temporal_delta = float(getattr(args, "kv_group_temporal_delta", 0.1))
-        sa.kv_group_temporal_discount_min = float(getattr(args, "kv_group_temporal_discount_min", 0.0))
-        sa.kv_group_temporal_rho = float(getattr(args, "kv_group_temporal_rho", 0.9))
-        sa.kv_group_temporal_eps = float(getattr(args, "kv_group_temporal_eps", 0.0))
-        sa.kv_group_temporal_warmup_steps = int(getattr(args, "kv_group_temporal_warmup_steps", 0))
-        sa.kv_group_temporal_dyn_eta = float(getattr(args, "kv_group_temporal_dyn_eta", 0.0))
-        sa.kv_group_temporal_mode = str(getattr(args, "kv_group_temporal_mode", "exponential"))
-        sa.kv_group_temporal_gamma = float(getattr(args, "kv_group_temporal_gamma", 1.0))
-        sa.kv_group_temporal_debug = bool(getattr(args, "kv_group_temporal_debug", False))
         sa.kv_group_temporal_step = 0
         sa.kv_group_temporal_pattern_ema = None
+        sa.kv_group_temporal_last_discount = None
+        sa.kv_group_temporal_last_trace = None
         sa.kv_group_temporal_last_stats = {}
 
 
-def normalize_starkv_eval_args(args, force_full_starkv_stack=True):
-    """
-    Fill non-None defaults for compressed-KV / STaR-KV eval.
+def set_starkv_group_config(model, args):
+    """Propagate the canonical MI/TEM/SFR configuration to attention layers."""
+    layers = iter_language_model_layers(model, getattr(args, "model_path", ""))
+    if not layers:
+        raise NotImplementedError("Model not supported")
+    enable_metrics = bool(getattr(args, "runtime_metrics", False))
+    tem_on = bool(getattr(args, "kv_group_temporal_enable", False))
+    tem_delta_raw = getattr(args, "kv_group_temporal_delta", 0.20)
+    tem_delta = 0.20 if tem_delta_raw is None else float(tem_delta_raw)
+    sfr_on = bool(getattr(args, "kv_group_sfr_enable", False))
+    _sfr_lam = getattr(args, "kv_group_sfr_lambda", 0.3)
+    sfr_lam = 0.3 if _sfr_lam is None else float(_sfr_lam)
+    single_image_mi_on = bool(getattr(args, "kv_group_single_image_mi_enable", False))
+    current_frame_mi_on = bool(getattr(args, "kv_group_current_frame_mi_enable", False))
+    tem_decay_mode = str(getattr(args, "kv_group_temporal_decay_mode", "exponential") or "exponential")
+    mi_granularity = str(getattr(args, "kv_group_mi_granularity", "group") or "group")
+    mi_prior_mode = str(getattr(args, "kv_group_mi_prior_mode", "online") or "online")
+    for layer in layers:
+        sa = layer.self_attn
+        sa.kv_runtime_metrics_enable = enable_metrics
+        sa.kv_group_temporal_enable = tem_on
+        sa.kv_group_temporal_delta = tem_delta
+        sa.kv_group_sfr_enable = sfr_on
+        sa.kv_group_sfr_lambda = sfr_lam
+        if getattr(args, "kv_cache", None) == "starkv":
+            sa.kv_group_soft_prior_lambda = float(args.kv_group_soft_prior_lambda)
+            sa.kv_group_online_profile_steps = int(args.kv_group_online_profile_steps)
+            sa.kv_group_online_profile_decay = float(args.kv_group_online_profile_decay)
+            sa.kv_group_online_profile_tau = float(args.kv_group_online_profile_tau)
+            sa.kv_group_online_profile_lambda_ramp_steps = int(args.kv_group_online_profile_lambda_ramp_steps)
+            sa.kv_group_single_image_mi_enable = single_image_mi_on
+            sa.kv_group_current_frame_mi_enable = current_frame_mi_on
+            sa.kv_group_temporal_rho = float(args.kv_group_temporal_rho)
+            sa.kv_group_temporal_discount_min = float(args.kv_group_temporal_discount_min)
+            sa.kv_group_temporal_eps = float(args.kv_group_temporal_eps)
+            sa.kv_group_temporal_warmup_steps = int(args.kv_group_temporal_warmup_steps)
+            sa.kv_group_temporal_decay_mode = tem_decay_mode
+            sa.kv_group_mi_granularity = mi_granularity
+            sa.kv_group_mi_prior_mode = mi_prior_mode
+        sa.kv_group_temporal_last_trace = None
+        sa.kv_group_temporal_last_stats = {}
+        if getattr(sa, "config", None) is not None:
+            sa.config.kv_group_temporal_enable = tem_on
+            sa.config.kv_group_temporal_delta = tem_delta
+            sa.config.kv_group_sfr_enable = sfr_on
+            sa.config.kv_group_sfr_lambda = sfr_lam
+            sa.config.kv_group_single_image_mi_enable = single_image_mi_on
+            sa.config.kv_group_current_frame_mi_enable = current_frame_mi_on
+            sa.config.kv_group_temporal_decay_mode = tem_decay_mode
+            sa.config.kv_group_mi_granularity = mi_granularity
+            sa.config.kv_group_mi_prior_mode = mi_prior_mode
 
-    When kv_cache is starkv and force_full_starkv_stack is
-    True (default), enable full STaR-KV stack (AEB + temporal) for scripts that use ``store_true``
-    without passing these flags.
 
-    Set force_full_starkv_stack=False for parsers that use BooleanOptionalAction with
-    explicit defaults (e.g. AgentNetBench ablations).
-    """
+def normalize_starkv_eval_args(args):
+    """Fill defaults for Top-K + spatial (+ TEM delta / SFR)."""
+    kv = getattr(args, "kv_cache", None)
     if getattr(args, "alpha", None) is None:
         args.alpha = 2.0
     if getattr(args, "window_size", None) is None:
         args.window_size = 8
     if getattr(args, "temperature", None) is None:
         args.temperature = 3.5
-
-    if is_starkv_kv(getattr(args, "kv_cache", None)):
-        args.kv_group_selection_mode = "soft_global"
-
-    kv = getattr(args, "kv_cache", None)
+    if not hasattr(args, "kv_group_temporal_enable"):
+        args.kv_group_temporal_enable = False
+    if getattr(args, "kv_group_temporal_delta", None) is None:
+        args.kv_group_temporal_delta = 0.20
+    if not hasattr(args, "kv_group_sfr_enable"):
+        args.kv_group_sfr_enable = False
+    if getattr(args, "kv_group_sfr_lambda", None) is None:
+        args.kv_group_sfr_lambda = 0.3
+    if kv == "starkv":
+        if not 0.0 <= float(args.kv_group_soft_prior_lambda) <= 1.0:
+            raise ValueError("kv_group_soft_prior_lambda must be in [0,1]")
+        if int(args.kv_group_online_profile_steps) < 0 or int(args.kv_group_online_profile_lambda_ramp_steps) <= 0:
+            raise ValueError("MI profile/ramp steps must be non-negative/positive")
+        if not 0.0 <= float(args.kv_group_online_profile_decay) < 1.0 or float(args.kv_group_online_profile_tau) <= 0.0:
+            raise ValueError("MI decay must be in [0,1) and tau > 0")
+        if not 0.0 <= float(args.kv_group_temporal_rho) < 1.0:
+            raise ValueError("TEM rho must be in [0,1)")
+        if float(args.kv_group_temporal_delta) < 0.0 or not 0.0 <= float(args.kv_group_temporal_discount_min) <= 1.0:
+            raise ValueError("TEM delta must be >=0 and discount_min in [0,1]")
+        if not 0.0 <= float(args.kv_group_temporal_eps) <= 1.0 or int(args.kv_group_temporal_warmup_steps) < 0:
+            raise ValueError("TEM eps must be in [0,1] and warmup >= 0")
     if not is_starkv_kv(kv):
-        if hasattr(args, "kv_group_temporal_enable"):
-            args.kv_group_temporal_enable = False
-        if hasattr(args, "kv_entropy_budget_enable"):
-            args.kv_entropy_budget_enable = False
-        return args
-
-    if force_full_starkv_stack:
-        if hasattr(args, "kv_entropy_budget_enable"):
-            args.kv_entropy_budget_enable = True
-        if hasattr(args, "kv_group_temporal_enable"):
-            args.kv_group_temporal_enable = True
-
-    starkv_defaults = {
-        "kv_group_soft_prior_source": "mi_saliency",
-        "kv_group_mi_saliency_weight": 0.5,
-        "kv_group_soft_prior_lambda": 0.5,
-        "kv_group_online_profile_steps": 5,
-        "kv_group_online_profile_decay": 0.9,
-        "kv_group_online_profile_tau": 1.0,
-        "kv_group_online_profile_lambda_ramp_steps": 10,
-        "kv_entropy_budget_scope": "layer",
-        "kv_entropy_budget_min_scale": 0.95,
-        "kv_entropy_budget_max_scale": 1.05,
-        "kv_entropy_budget_smooth": 0.0,
-        "kv_group_temporal_delta": 0.2,
-        "kv_group_temporal_discount_min": 0.1,
-        "kv_group_temporal_rho": 0.9,
-        "kv_group_temporal_eps": 0.0,
-        "kv_group_temporal_warmup_steps": 0,
-        "kv_group_temporal_mode": "exponential",
-        "kv_group_temporal_gamma": 1.0,
-    }
-    for key, val in starkv_defaults.items():
-        if hasattr(args, key) and getattr(args, key) is None:
-            setattr(args, key, val)
+        args.kv_group_temporal_enable = False
+        args.kv_group_sfr_enable = False
     return args
 
-# set_torch_profiler removed per user request
 
-                        
-
-
-        
-        
 def _coerce_vision_idx_for_layers(vision_idx):
-    """
-    Normalize vision indices to a list of ints for multi-frame temporal discount.
-    Accepts int, list/tuple of int, or 1D tensor. Single int becomes [int].
-    """
     if vision_idx is None:
         return None
     if isinstance(vision_idx, torch.Tensor):
@@ -913,33 +1001,132 @@ def _coerce_vision_idx_for_layers(vision_idx):
 
 def set_vision_start_idx(model, vision_start_idx, args):
     vs = _coerce_vision_idx_for_layers(vision_start_idx)
-    if "UI-TARS" in args.model_path:
-        for layer in model.model.language_model.layers:
-            layer.self_attn.vision_start_idx = vs
-            if getattr(layer.self_attn, "config", None) is not None:
-                setattr(layer.self_attn.config, "vision_start_idx", vs)
-    elif "OpenCUA" in args.model_path:
-        for layer in model.language_model.model.layers:
-            layer.self_attn.vision_start_idx = vs
-            if getattr(layer.self_attn, "config", None) is not None:
-                setattr(layer.self_attn.config, "vision_start_idx", vs)
-    else:
-        raise NotImplementedError("Model not supported")
+    for layer in iter_language_model_layers(model, getattr(args, "model_path", "")):
+        layer.self_attn.vision_start_idx = vs
+        if getattr(layer.self_attn, "config", None) is not None:
+            setattr(layer.self_attn.config, "vision_start_idx", vs)
+
 
 def set_vision_end_idx(model, vision_end_idx, args):
     ve = _coerce_vision_idx_for_layers(vision_end_idx)
-    if "UI-TARS" in args.model_path:
-        for layer in model.model.language_model.layers:
-            layer.self_attn.vision_end_idx = ve
-            if getattr(layer.self_attn, "config", None) is not None:
-                setattr(layer.self_attn.config, "vision_end_idx", ve)
-    elif "OpenCUA" in args.model_path:
-        for layer in model.language_model.model.layers:
-            layer.self_attn.vision_end_idx = ve
-            if getattr(layer.self_attn, "config", None) is not None:
-                setattr(layer.self_attn.config, "vision_end_idx", ve)
-    else:
+    for layer in iter_language_model_layers(model, getattr(args, "model_path", "")):
+        layer.self_attn.vision_end_idx = ve
+        if getattr(layer.self_attn, "config", None) is not None:
+            setattr(layer.self_attn.config, "vision_end_idx", ve)
+
+
+def resolve_spatial_merge_size(model, args):
+    """Read model.visual.spatial_merge_size (UI-TARS / OpenCUA)."""
+    try:
+        path = str(getattr(args, "model_path", "") or "")
+        if "UI-TARS" in path or "ui-tars" in path.lower():
+            vis = getattr(model, "visual", None)
+            if vis is None and hasattr(model, "model"):
+                vis = getattr(model.model, "visual", None)
+            if vis is not None and hasattr(vis, "spatial_merge_size"):
+                return int(vis.spatial_merge_size)
+        if "OpenCUA" in path or "opencua" in path.lower():
+            vis = getattr(model, "visual", None)
+            if vis is None:
+                lm = getattr(model, "language_model", None)
+                vis = getattr(lm, "visual", None) if lm is not None else None
+            if vis is not None and hasattr(vis, "spatial_merge_size"):
+                return int(vis.spatial_merge_size)
+            return 2
+    except Exception:
+        return None
+    return None
+
+
+def set_vision_spans(model, vision_spans, args):
+    """Attach validated VisionSpan list (+ legacy start/end) to every attention layer."""
+    layers = iter_language_model_layers(model, getattr(args, "model_path", ""))
+    if not layers:
         raise NotImplementedError("Model not supported")
+    for layer in layers:
+        sa = layer.self_attn
+        sa.vision_spans = vision_spans
+        if getattr(sa, "config", None) is not None:
+            setattr(sa.config, "vision_spans", vision_spans)
+        if vision_spans:
+            sa.vision_start_idx = [int(s.start) for s in vision_spans]
+            sa.vision_end_idx = [int(s.end) for s in vision_spans]
+            if getattr(sa, "config", None) is not None:
+                setattr(sa.config, "vision_start_idx", sa.vision_start_idx)
+                setattr(sa.config, "vision_end_idx", sa.vision_end_idx)
+
+
+def set_vision_spans_from_grids(
+    model,
+    vision_start_idx,
+    vision_end_idx,
+    image_grid_thw,
+    args,
+    spatial_merge_size=None,
+):
+    """Build real-grid VisionSpan metadata; never sqrt-guess."""
+    from starkv.starkv_utils import build_vision_spans
+
+    ms = spatial_merge_size if spatial_merge_size is not None else resolve_spatial_merge_size(model, args)
+    starts = _coerce_vision_idx_for_layers(vision_start_idx) or []
+    ends = _coerce_vision_idx_for_layers(vision_end_idx) or []
+    spans, err = build_vision_spans(starts, ends, image_grid_thw, ms)
+    set_vision_start_idx(model, starts, args)
+    set_vision_end_idx(model, ends, args)
+    layers = iter_language_model_layers(model, getattr(args, "model_path", ""))
+    if err is not None:
+        set_vision_spans(model, [], args)
+        for layer in layers:
+            layer.self_attn.vision_spans_error = err
+        return [], err
+    set_vision_spans(model, spans, args)
+    for layer in layers:
+        layer.self_attn.vision_spans_error = None
+    return spans, None
+
+
+def apply_vision_analysis_to_model(model, vision_analysis, args):
+    """Stamp vision start/end (+ grids / VisionSpan) from analyze_vision_tokens_*."""
+    if not vision_analysis:
+        return None
+    starts = vision_analysis.get("vision_start_idx")
+    ends = vision_analysis.get("vision_end_idx")
+    grids = vision_analysis.get("vision_token_grids")
+    thw = vision_analysis.get("image_grid_thw")
+    merge = vision_analysis.get("spatial_merge_size", vision_analysis.get("merge_size"))
+    set_vision_start_idx(model, starts, args)
+    set_vision_end_idx(model, ends, args)
+    layers = iter_language_model_layers(model, getattr(args, "model_path", ""))
+    if grids is not None:
+        for layer in layers:
+            layer.self_attn.vision_token_grids = grids
+            if getattr(layer.self_attn, "config", None) is not None:
+                setattr(layer.self_attn.config, "vision_token_grids", grids)
+    if thw is not None and starts is not None and ends is not None:
+        return set_vision_spans_from_grids(
+            model, starts, ends, thw, args, spatial_merge_size=merge
+        )
+    # Fallback: build VisionSpan from post-merge (H, W) grids when thw omitted.
+    if grids is not None and starts is not None and ends is not None:
+        from starkv.starkv_utils import VisionSpan
+
+        start_list = _coerce_vision_idx_for_layers(starts) or []
+        end_list = _coerce_vision_idx_for_layers(ends) or []
+        spans = []
+        for i, (s, e) in enumerate(zip(start_list, end_list)):
+            if i >= len(grids):
+                break
+            g = grids[i]
+            if isinstance(g, (list, tuple)) and len(g) >= 2:
+                gh, gw = int(g[-2]), int(g[-1])
+            else:
+                continue
+            spans.append(VisionSpan(start=int(s), end=int(e), grid_t=1, grid_h=gh, grid_w=gw))
+        if spans:
+            set_vision_spans(model, spans, args)
+            return spans, None
+    return None
+
 
 def set_alpha(model, args):
     if "UI-TARS" in args.model_path:
@@ -968,9 +1155,11 @@ def set_window_size(model, args):
         ws = 256
     if "UI-TARS" in args.model_path:
         for layer in model.model.language_model.layers:
+            layer.self_attn.kv_window_size = ws
             layer.self_attn.config.window_size = ws
     elif "OpenCUA" in args.model_path:
         for layer in model.language_model.model.layers:
+            layer.self_attn.kv_window_size = ws
             layer.self_attn.config.window_size = ws
     else:
         raise NotImplementedError("Model not supported")
@@ -984,7 +1173,7 @@ def replace_qwen2_5_vl(kv_cache_mode="original"):
     transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLVisionAttention.forward = qwen2_5_vl_vision_attention_forward
     if kv_cache_mode == "original":
         transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLAttention.forward = qwen2_5_vl_attention_forward
-    elif is_starkv_kv(kv_cache_mode):
+    elif is_compressed_kv(kv_cache_mode):
         transformers.models.qwen2_5_vl.modeling_qwen2_5_vl.Qwen2_5_VLAttention.forward = qwen2_5_vl_attention_forward_STARKV
 
 
@@ -992,59 +1181,140 @@ def replace_opencua(kv_cache_mode="original"):
     assert kv_cache_mode in ("original", "starkv")
     if kv_cache_mode == "original":
         pass
-    elif is_starkv_kv(kv_cache_mode):
+    elif is_compressed_kv(kv_cache_mode):
         transformers.models.qwen2.modeling_qwen2.Qwen2Attention.forward = qwen2_attention_forward_STARKV
 
 
-def collect_entropy_budget_stats(model, args):
-    """Collect AEB runtime statistics from the first attention layer.
+def iter_language_model_layers(model, model_path: str):
+    """Yield language-model transformer layers for UI-TARS / OpenCUA layouts."""
+    path = str(model_path or "")
+    if "UI-TARS" in path:
+        return list(model.model.language_model.layers)
+    if "OpenCUA" in path or "opencua" in path.lower():
+        return list(model.language_model.model.layers)
+    # Best-effort fallbacks
+    for attr_path in (
+        ("model", "language_model", "layers"),
+        ("language_model", "model", "layers"),
+        ("model", "layers"),
+    ):
+        cur = model
+        ok = True
+        for a in attr_path:
+            if not hasattr(cur, a):
+                ok = False
+                break
+            cur = getattr(cur, a)
+        if ok:
+            return list(cur)
+    return []
 
-    Reads _aeb_last_debug for entropy/temperature info.
-    Only meaningful when kv_cache is product STaR-KV and AEB is active.
-    Returns None unless kv_cache is starkv.
-    """
-    kv_cache = getattr(args, "kv_cache", None)
-    enable = bool(getattr(args, "kv_entropy_budget_enable", False))
 
-    if not is_starkv_kv(kv_cache):
-        return None
-    if not enable:
-        return None
+def collect_mi_diagnostics_from_model(model, model_path: str) -> Dict[str, Any]:
+    """Stub: MI removed."""
+    return {"mi_stats_by_layer": {}, "mi_stats_aggregate": {}, "mi_stats": None}
 
-    if "UI-TARS" in args.model_path:
-        try:
-            sa = model.model.language_model.layers[0].self_attn
-        except Exception:
-            return None
-    elif "OpenCUA" in args.model_path:
-        try:
-            sa = model.language_model.model.layers[0].self_attn
-        except Exception:
-            return None
-    else:
-        return None
 
-    kc = getattr(sa, "kv_cluster", None)
-    if kc is None:
-        return None
 
-    dbg = getattr(kc, "_aeb_last_debug", None) or getattr(sa, "_aeb_last_debug", None)
-    temperature = getattr(kc, "_aeb_temperature_ema", None) or getattr(sa, "_aeb_temperature_ema", None)
-    base_cap = getattr(kc, "max_capacity_prompt", None)
-    win_size = getattr(kc, "window_size", None)
+def collect_cvi_diagnostics_from_model(model, model_path: str) -> Dict[str, Any]:
+    """Stub: CVI removed."""
+    return {"cvi_stats_by_layer": {}, "cvi_stats": None, "cvi_recon_by_layer": {}}
 
+
+
+def collect_group_specialization_from_model(model, model_path: str) -> Dict[str, Any]:
+    """Stub: per-group specialization removed."""
     return {
-        "enable": enable,
-        "active": True,
-        "temperature": temperature,
-        "normalized_entropy": dbg.get("normalized_entropy") if isinstance(dbg, dict) else None,
-        "entropy": dbg.get("entropy") if isinstance(dbg, dict) else None,
-        "max_entropy": dbg.get("max_entropy") if isinstance(dbg, dict) else None,
-        "base_capacity": base_cap,
-        "window_size": win_size,
-        "base_k_keep": (base_cap - win_size) if (base_cap is not None and win_size is not None) else None,
-        "policy": "fixed_score_temperature",
+        "group_specialization_by_layer": {},
+        "group_specialization": None,
+        "per_group_by_layer": {},
+        "per_group": None,
     }
+
+
+def collect_temporal_diagnostics_from_model(model, model_path: str) -> Dict[str, Any]:
+    """Aggregate last TEM traces across layers (after one generate)."""
+    layers = iter_language_model_layers(model, model_path)
+    by_layer = {}
+    applied = 0
+    reasons = {}
+    for layer in layers:
+        sa = layer.self_attn
+        tr = getattr(sa, "kv_group_temporal_last_trace", None) or getattr(
+            sa, "kv_group_temporal_last_stats", None
+        )
+        if not tr:
+            continue
+        idx = getattr(sa, "layer_idx", None)
+        key = str(idx if idx is not None else id(sa))
+        tr_applied = bool(tr.get("applied", tr.get("mode") == "exponential"))
+        tr_reason = tr.get("reason") or ("applied" if tr_applied else "unknown")
+        stability = tr.get("group_stability")
+        stability_mean = None
+        stability_p90 = None
+        if isinstance(stability, torch.Tensor) and stability.numel():
+            stability_f = stability.detach().float()
+            stability_mean = float(stability_f.mean().item())
+            stability_p90 = float(torch.quantile(stability_f, 0.9).item())
+        by_layer[key] = {
+            "applied": tr_applied,
+            "reason": tr_reason,
+            "valid_pair_count": tr.get("valid_pair_count"),
+            "redundancy_p90": tr.get("redundancy_p90", stability_p90),
+            "redundancy_mean": tr.get("redundancy_mean", stability_mean),
+        }
+        if tr_applied:
+            applied += 1
+        reasons[tr_reason] = reasons.get(tr_reason, 0) + 1
+    return {
+        "tem_layers_applied": applied,
+        "tem_reason_counts": reasons,
+        "tem_by_layer": by_layer,
+    }
+
+
+def collect_original_mi_diagnostics_from_model(model, model_path: str) -> Dict[str, Any]:
+    """Verify that the paper MI prior materially reweights at the last prefill."""
+    by_layer = {}
+    active = 0
+    modes = {}
+    for layer in iter_language_model_layers(model, model_path):
+        sa = layer.self_attn
+        lam = float(getattr(sa, "kv_group_online_profile_last_lam_eff", 0.0) or 0.0)
+        mode = str(getattr(sa, "kv_group_online_profile_last_mode", "not_run"))
+        weights = getattr(sa, "kv_group_online_profile_last_group_weights", None)
+        spread = None
+        if isinstance(weights, torch.Tensor) and weights.numel():
+            wf = weights.detach().float()
+            spread = float((wf.max() - wf.min()).item())
+        is_active = bool(lam > 0.0 and spread is not None and spread > 1e-8)
+        topk_changed = bool(
+            getattr(sa, "kv_group_online_profile_last_topk_changed", False)
+        )
+        topk_jaccard = getattr(
+            sa, "kv_group_online_profile_last_topk_jaccard", None
+        )
+        idx = getattr(sa, "layer_idx", None)
+        key = str(idx if idx is not None else id(sa))
+        by_layer[key] = {
+            "active": is_active,
+            "lambda_eff": lam,
+            "mode": mode,
+            "group_weight_spread": spread,
+            "pre_sfr_topk_changed": topk_changed,
+            "pre_sfr_topk_jaccard": topk_jaccard,
+        }
+        active += int(is_active)
+        modes[mode] = modes.get(mode, 0) + 1
+    return {
+        "mi_layers_active": active,
+        "mi_mode_counts": modes,
+        "mi_layers_pre_sfr_topk_changed": sum(
+            int(row["pre_sfr_topk_changed"]) for row in by_layer.values()
+        ),
+        "mi_by_layer": by_layer,
+    }
+
 
 # =============================================================================
 # KV Cache & GPU Memory Statistics Collection
@@ -1067,10 +1337,11 @@ class _KvCacheBudgetTracker:
       - original token count before compression (sum)
       - kept token count after compression (sum)
       - number of compression events
+      - actual cache tensor shapes / bytes when provided
     """
 
     def __init__(self):
-        self._stats = {}               # layer_idx -> {"orig": int, "kept": int, "count": int}
+        self._stats = {}               # layer_idx -> stats dict
         self._total_compress_calls = 0
         self._enabled = True
 
@@ -1079,15 +1350,31 @@ class _KvCacheBudgetTracker:
         self._total_compress_calls = 0
         self._enabled = True
 
-    def record(self, layer_idx, orig_len, kept_len):
+    def record(self, layer_idx, orig_len, kept_len, key_tensor=None, value_tensor=None):
         if not self._enabled:
             return
         if layer_idx not in self._stats:
-            self._stats[layer_idx] = {"orig": 0, "kept": 0, "count": 0}
-        self._stats[layer_idx]["orig"] += orig_len
-        self._stats[layer_idx]["kept"] += kept_len
-        self._stats[layer_idx]["count"] += 1
+            self._stats[layer_idx] = {
+                "orig": 0,
+                "kept": 0,
+                "count": 0,
+                "kept_bytes_sum": 0,
+                "key_shape": None,
+                "value_shape": None,
+                "dtype": None,
+            }
+        s = self._stats[layer_idx]
+        s["orig"] += orig_len
+        s["kept"] += kept_len
+        s["count"] += 1
         self._total_compress_calls += 1
+        if key_tensor is not None and value_tensor is not None:
+            s["key_shape"] = list(key_tensor.shape)
+            s["value_shape"] = list(value_tensor.shape)
+            s["dtype"] = str(key_tensor.dtype).replace("torch.", "")
+            s["kept_bytes_sum"] += int(key_tensor.numel() * key_tensor.element_size()) + int(
+                value_tensor.numel() * value_tensor.element_size()
+            )
 
     def get_summary(self, num_layers=28):
         """Return aggregated KV cache stats dict for summary_results.json."""
@@ -1098,26 +1385,55 @@ class _KvCacheBudgetTracker:
         total_count = sum(s["count"] for s in self._stats.values())
         avg_compress_per_layer = total_count // max(1, len(self._stats))
         retention = total_kept / max(1, total_orig)
+        total_kept_bytes = sum(s.get("kept_bytes_sum", 0) for s in self._stats.values())
 
         per_layer = {}
         for i in range(num_layers):
             s = self._stats.get(i)
             if s and s["count"] > 0:
-                per_layer[i] = {
+                entry = {
                     "avg_orig_tokens": round(s["orig"] / s["count"], 1),
                     "avg_kept_tokens": round(s["kept"] / s["count"], 1),
                     "retention_ratio": round(s["kept"] / max(1, s["orig"]), 4),
                 }
+                if s.get("key_shape") is not None:
+                    entry["cache_key_shape"] = s["key_shape"]
+                    entry["cache_value_shape"] = s["value_shape"]
+                    entry["cache_dtype"] = s["dtype"]
+                    entry["avg_kept_kv_bytes"] = round(s["kept_bytes_sum"] / s["count"], 1)
+                per_layer[i] = entry
 
-        return {
+        # Infer native head layout from a recorded compress tensor when available.
+        sample_shape = None
+        sample_dtype = None
+        for s in self._stats.values():
+            if s.get("key_shape") is not None:
+                sample_shape = s["key_shape"]
+                sample_dtype = s.get("dtype")
+                break
+
+        out = {
             "num_compression_events": self._total_compress_calls,
             "num_layers_logged": len(self._stats),
             "avg_compression_events_per_layer": avg_compress_per_layer,
             "total_orig_tokens": total_orig,
             "total_kept_tokens": total_kept,
             "overall_retention_ratio": round(retention, 4),
+            "total_kept_kv_bytes": int(total_kept_bytes),
+            "total_kept_kv_mb": round(total_kept_bytes / (1024 ** 2), 3),
             "per_layer": per_layer,
         }
+        if sample_shape is not None and len(sample_shape) >= 4:
+            # (batch, num_kv_heads, seq, head_dim)
+            out["reported_cache_layout"] = {
+                "batch": sample_shape[0],
+                "num_kv_heads": sample_shape[1],
+                "seq_len_example": sample_shape[2],
+                "head_dim": sample_shape[3],
+                "dtype": sample_dtype,
+                "note": "Shapes/bytes are measured from tensors written to past_key_value, not theoretical estimates.",
+            }
+        return out
 
 
 # Global singleton – reset at the start of each eval run.
@@ -1134,9 +1450,9 @@ def collect_kv_cache_stats(num_layers=28):
     return KV_CACHE_STATS.get_summary(num_layers=num_layers)
 
 
-def _record_kv_cache(layer_idx, orig_len, kept_len):
+def _record_kv_cache(layer_idx, orig_len, kept_len, key_tensor=None, value_tensor=None):
     """Convenience wrapper used by attention forward paths."""
-    KV_CACHE_STATS.record(layer_idx, orig_len, kept_len)
+    KV_CACHE_STATS.record(layer_idx, orig_len, kept_len, key_tensor=key_tensor, value_tensor=value_tensor)
 
 
 # ---------------------------------------------------------------------------
@@ -1169,9 +1485,10 @@ def collect_gpu_memory_stats(device="cuda"):
 
 def estimate_kv_cache_memory_mb(num_tokens, num_layers=28, num_kv_heads=4,
                                  head_dim=128, dtype_bytes=2):
-    """Rough estimate of KV cache memory for a given token count.
+    """Theoretical KV-cache size assuming native GQA ``num_kv_heads`` layout.
 
-    Formula: num_tokens * num_layers * num_kv_heads * head_dim * 2(K+V) * dtype_bytes
+    Prefer measured ``total_kept_kv_bytes`` from compression tracking when
+    comparing methods; this formula is only a fallback for token-count scaling.
     """
     bytes_per_token = num_layers * num_kv_heads * head_dim * 2 * dtype_bytes
     return round(num_tokens * bytes_per_token / (1024 ** 2), 2)
@@ -1179,17 +1496,35 @@ def estimate_kv_cache_memory_mb(num_tokens, num_layers=28, num_kv_heads=4,
 
 def compute_kv_cache_memory_summary(kv_stats, num_layers=28, num_kv_heads=4,
                                     head_dim=128, dtype_bytes=2):
-    """Augment kv_stats dict with estimated memory in MB/GB."""
+    """Augment kv_stats with measured bytes when available, else theoretical MB."""
     if kv_stats is None:
         return None
+    summary = dict(kv_stats)
     total_orig = kv_stats.get("total_orig_tokens", 0)
     total_kept = kv_stats.get("total_kept_tokens", 0)
+
+    # Prefer actual tensor bytes written at compression time.
+    measured_kept_bytes = kv_stats.get("total_kept_kv_bytes")
+    layout = kv_stats.get("reported_cache_layout") or {}
+    measured_heads = layout.get("num_kv_heads")
+    measured_dim = layout.get("head_dim")
+    if measured_heads:
+        num_kv_heads = int(measured_heads)
+    if measured_dim:
+        head_dim = int(measured_dim)
+
     orig_mb = estimate_kv_cache_memory_mb(total_orig, num_layers, num_kv_heads,
                                            head_dim, dtype_bytes)
-    kept_mb = estimate_kv_cache_memory_mb(total_kept, num_layers, num_kv_heads,
-                                           head_dim, dtype_bytes)
+    if measured_kept_bytes is not None and measured_kept_bytes > 0:
+        kept_mb = round(measured_kept_bytes / (1024 ** 2), 2)
+        summary["kept_memory_source"] = "measured_tensor_nbytes"
+    else:
+        kept_mb = estimate_kv_cache_memory_mb(total_kept, num_layers, num_kv_heads,
+                                               head_dim, dtype_bytes)
+        summary["kept_memory_source"] = "token_count_x_native_kv_heads"
     saved_mb = orig_mb - kept_mb
-    summary = dict(kv_stats)
+    summary["memory_estimate_assumes_num_kv_heads"] = num_kv_heads
+    summary["memory_estimate_assumes_head_dim"] = head_dim
     summary["orig_kv_cache_mb"] = orig_mb
     summary["orig_kv_cache_gb"] = round(orig_mb / 1024, 3)
     summary["kept_kv_cache_mb"] = kept_mb
@@ -1207,98 +1542,137 @@ def add_starkv_kv_arguments(
     kv_cache_default: str = "original",
     kv_cache_budget_default: float = 100,
     kv_cache_budget_type: type = float,
-    soft_prior_source_default: str = "profile",
-    online_profile_steps_default: int = 0,
-    online_profile_lambda_ramp_default: int = 0,
-    temporal_warmup_default: int = 20,
-    aeb_enable_action: str = "store_true",
     temporal_enable_action: str = "store_true",
-    aeb_min_scale_default: float = 0.5,
-    aeb_max_scale_default: float = 1.5,
     alpha_default: Optional[float] = 2.0,
     temperature_default: float = 3.5,
-    include_mi_granularity: bool = False,
     include_max_samples: bool = False,
 ) -> None:
-    """Register KV-cache / STaR-KV CLI flags shared across benchmark evaluators."""
+    """Register KV-cache CLI flags: shared Top-K + spatial + optional TEM."""
     parser.add_argument(
         "--kv_cache",
         type=str,
         default=kv_cache_default,
         choices=["original", "starkv"],
-        help="KV cache: starkv (STaR-KV compression) or original (full cache).",
+        help=(
+            "KV cache method: original (full cache) or starkv (MI + TEM + SFR)."
+        ),
     )
     parser.add_argument(
         "--kv_cache_budget",
         type=kv_cache_budget_type,
         default=kv_cache_budget_default,
-        help="KV cache budget (percent of full cache unless noted in benchmark).",
+        help=(
+            "Total retained prefill KV percent, including the recent window. "
+            "SFR selects the remaining capacity after reserving the window."
+        ),
     )
-    parser.add_argument("--kv_group_soft_prior_lambda", type=float, default=0.5)
     parser.add_argument(
-        "--kv_group_soft_prior_source",
-        type=str,
-        default=soft_prior_source_default,
-        choices=["profile", "saliency_only", "mi_saliency"],
+        "--baseline_gqa_mode",
+        choices=("group_mean",),
+        default="group_mean",
+        help="Canonical native-GQA projection; no query-head expansion is supported.",
     )
-    parser.add_argument("--kv_group_mi_saliency_weight", type=float, default=0.5)
-    parser.add_argument("--kv_group_online_profile_steps", type=int, default=online_profile_steps_default)
-    parser.add_argument("--kv_group_online_profile_decay", type=float, default=0.9)
-    parser.add_argument("--kv_group_online_profile_tau", type=float, default=1.0)
     parser.add_argument(
-        "--kv_group_online_profile_lambda_ramp_steps",
-        type=int,
-        default=online_profile_lambda_ramp_default,
+        "--kv_budget_semantics",
+        choices=("total_including_window",),
+        default="total_including_window",
+        help="Total prefill KV capacity, including the protected recent window.",
     )
-    if include_mi_granularity:
-        parser.add_argument(
-            "--kv_group_mi_granularity",
-            type=str,
-            default="gqa_group",
-            choices=["gqa_group", "mha_head"],
-        )
+    parser.add_argument(
+        "--runtime_metrics",
+        action="store_true",
+        help="Record wall-clock TTFT/ITL/e2e generate latency into summary JSON.",
+    )
+    parser.add_argument(
+        "--runtime_metrics_sync_cuda",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Synchronize CUDA around generate latency probes (default: true).",
+    )
     if temporal_enable_action == "boolean_optional":
         parser.add_argument(
             "--kv_group_temporal_enable",
             action=argparse.BooleanOptionalAction,
-            default=True,
+            default=False,
+            help="Enable STaR-KV temporal stability reweighting.",
         )
-    else:
-        parser.add_argument("--kv_group_temporal_enable", action="store_true")
-    parser.add_argument("--kv_group_temporal_rho", type=float, default=0.9)
-    parser.add_argument("--kv_group_temporal_delta", type=float, default=0.1)
-    parser.add_argument("--kv_group_temporal_eps", type=float, default=0.0)
-    parser.add_argument("--kv_group_temporal_discount_min", type=float, default=0.0)
-    parser.add_argument("--kv_group_temporal_warmup_steps", type=int, default=temporal_warmup_default)
-    parser.add_argument("--kv_group_temporal_debug", action="store_true")
-    parser.add_argument("--kv_group_temporal_dyn_eta", type=float, default=0.0)
-    parser.add_argument(
-        "--kv_group_temporal_mode",
-        type=str,
-        default="exponential",
-        choices=["exponential", "linear", "gamma"],
-    )
-    parser.add_argument("--kv_group_temporal_gamma", type=float, default=1.0)
-    parser.add_argument("--alpha", type=float, default=alpha_default)
-    parser.add_argument("--window_size", type=int, default=None)
-    parser.add_argument("--temperature", type=float, default=temperature_default)
-    if aeb_enable_action == "store_true":
-        parser.add_argument("--kv_entropy_budget_enable", action="store_true")
     else:
         parser.add_argument(
-            "--kv_entropy_budget_enable",
-            action=argparse.BooleanOptionalAction,
-            default=True,
+            "--kv_group_temporal_enable",
+            action="store_true",
+            help="Enable STaR-KV temporal stability reweighting.",
         )
-    parser.add_argument("--kv_entropy_budget_min_scale", type=float, default=aeb_min_scale_default)
-    parser.add_argument("--kv_entropy_budget_max_scale", type=float, default=aeb_max_scale_default)
-    parser.add_argument("--kv_entropy_budget_smooth", type=float, default=0.0)
     parser.add_argument(
-        "--kv_entropy_budget_scope",
-        type=str,
-        default="layer",
-        choices=["layer", "step"],
+        "--kv_group_temporal_delta",
+        type=float,
+        default=0.20,
+        help="Fixed TEM redundancy strength (default 0.20).",
     )
+    parser.add_argument("--kv_group_soft_prior_lambda", type=float, default=0.5)
+    parser.add_argument("--kv_group_online_profile_steps", type=int, default=5)
+    parser.add_argument("--kv_group_online_profile_decay", type=float, default=0.9)
+    parser.add_argument("--kv_group_online_profile_tau", type=float, default=1.0)
+    parser.add_argument("--kv_group_online_profile_lambda_ramp_steps", type=int, default=10)
+    parser.add_argument(
+        "--kv_group_single_image_mi_enable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the current paper MI estimate immediately for independent single-image "
+            "samples; multi-frame evaluation keeps the online EMA/ramp."
+        ),
+    )
+    parser.add_argument(
+        "--kv_group_current_frame_mi_enable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use the current-frame paper MI estimate immediately for independent "
+            "prefills, including prompts that contain history images (AndroidControl)."
+        ),
+    )
+    parser.add_argument("--kv_group_temporal_rho", type=float, default=0.9)
+    parser.add_argument("--kv_group_temporal_discount_min", type=float, default=0.1)
+    parser.add_argument("--kv_group_temporal_eps", type=float, default=0.0)
+    parser.add_argument("--kv_group_temporal_warmup_steps", type=int, default=0)
+    parser.add_argument(
+        "--kv_group_temporal_decay_mode",
+        type=str,
+        default="exponential",
+        choices=("exponential",),
+        help="Canonical paper exponential TEM discount.",
+    )
+    parser.add_argument(
+        "--kv_group_mi_granularity",
+        type=str,
+        default="group",
+        choices=("group",),
+        help="Canonical native-GQA group/subspace MI granularity.",
+    )
+    parser.add_argument(
+        "--kv_group_mi_prior_mode",
+        type=str,
+        default="online",
+        choices=("online",),
+        help="Canonical online EMA MI prior.",
+    )
+    parser.add_argument(
+        "--kv_group_sfr_enable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable STaR-KV Specialist Fair Retention.",
+    )
+    parser.add_argument(
+        "--kv_group_sfr_lambda",
+        type=float,
+        default=0.3,
+        help="SFR fairness weight λ in [0,1] (default 0.3).",
+    )
+    parser.add_argument("--alpha", type=float, default=alpha_default,
+                        help="Spatial boost strength (0 disables). Default 2.0 for starkv.")
+    parser.add_argument("--window_size", type=int, default=None)
+    parser.add_argument("--temperature", type=float, default=temperature_default,
+                        help="Spatial softmax temperature (default 3.5 for starkv).")
     if include_max_samples:
         parser.add_argument("--max_samples", type=int, default=None)
 
@@ -1306,14 +1680,16 @@ def add_starkv_kv_arguments(
 def finalize_starkv_args(
     args: argparse.Namespace,
     *,
-    force_full_starkv_stack: bool = False,
     disable_starkv_extras_for_original: bool = False,
 ) -> None:
-    """Post-parse defaults shared by screen benchmarks."""
-    normalize_starkv_eval_args(args, force_full_starkv_stack=force_full_starkv_stack)
-    if disable_starkv_extras_for_original and not is_starkv_kv(args.kv_cache):
+    """Post-parse defaults for Top-K + spatial + TEM/SFR."""
+    normalize_starkv_eval_args(args)
+    if disable_starkv_extras_for_original and not is_starkv_kv(
+        getattr(args, "kv_cache", None)
+    ):
         args.kv_group_temporal_enable = False
-        args.kv_entropy_budget_enable = False
+        if hasattr(args, "kv_group_sfr_enable"):
+            args.kv_group_sfr_enable = False
 
 
 # --- No-GPU smoke tests; run: python attention_helpers.py ---
@@ -1324,69 +1700,11 @@ def test_attention_helpers() -> None:
 
     assert ah.is_starkv_kv("starkv")
     assert not ah.is_starkv_kv("original")
+    assert ah.needs_vision_spans("starkv")
+    assert not ah.is_compressed_kv("original")
 
-
-def test_starkv_mi() -> None:
-    import numpy as np
-    from starkv_mi import strict_mi_score_2d
-
-    p = np.array([0.1, 0.2, 0.3, 0.4])
-    p = p / p.sum()
-    row_bins = np.array([0, 0, 1, 1])
-    col_bins = np.array([0, 1, 0, 1])
-    mi = strict_mi_score_2d(p, row_bins, col_bins, 2, 2, 4)
-    assert mi >= 0.0
-
-
-def test_starkv_cli() -> None:
-
-    p = argparse.ArgumentParser()
-    add_starkv_kv_arguments(p, include_max_samples=True)
-    args = p.parse_args(["--kv_cache", "starkv", "--kv_cache_budget", "20"])
-    finalize_starkv_args(args)
-    assert getattr(args, "kv_group_selection_mode", None) == "soft_global"
-
-
-def test_ui_tars_core() -> None:
-    from ui_tars_utils import (
-        IMAGE_FACTOR,
-        MAX_PIXELS,
-        MIN_PIXELS,
-        parse_action_to_structure_output,
-        smart_resize,
-    )
-
-    h, w = smart_resize(1000, 800, factor=IMAGE_FACTOR)
-    assert h % IMAGE_FACTOR == 0 and w % IMAGE_FACTOR == 0
-    assert MIN_PIXELS <= h * w <= MAX_PIXELS * 4 or True  # bounds depend on aspect
-    out = parse_action_to_structure_output(
-        'Thought\nAction: click(point="<point>100 200</point>")',
-        origin_resized_height=600,
-        origin_resized_width=800,
-    )
-    assert isinstance(out, (dict, list, tuple)) or out is not None
-
-
-def test_eval_paths_import() -> None:
-    import eval_paths  # noqa: F401
-
-
-def run_smoke_tests() -> int:
-    tests = [
-        test_attention_helpers,
-        test_starkv_mi,
-        test_starkv_cli,
-        test_ui_tars_core,
-        test_eval_paths_import,
-    ]
-    for fn in tests:
-        name = fn.__name__
-        print(f"[smoke] {name} ...", flush=True)
-        fn()
-        print(f"[smoke] {name} OK", flush=True)
-    print("[smoke] all passed", flush=True)
-    return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(run_smoke_tests())
+    test_attention_helpers()
+    print("attention_helpers ok")

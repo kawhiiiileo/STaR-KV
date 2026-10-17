@@ -65,9 +65,23 @@ def analyze_vision_tokens_opencua_multi_images(tokenizer, input_ids, image_grid_
 
     assert len(vision_start_indices) == image_count, f"Expected {image_count} images but found {len(vision_start_indices)} <|media_begin|> markers"
 
+    # Post-merge token grid (H, W) from real image_grid_thw — used by screen-coordinate MI.
+    vision_token_grids = []
+    for img_idx in range(len(vision_start_indices)):
+        _, patch_h, patch_w = image_grid_thw[img_idx]
+        gh = max(1, int(patch_h) // int(merge_size))
+        gw = max(1, int(patch_w) // int(merge_size))
+        vision_token_grids.append((gh, gw))
+
     analysis = {
         'vision_start_idx': vision_start_indices,
         'vision_end_idx': vision_end_indices,
+        'vision_token_grids': vision_token_grids,
+        'merge_size': int(merge_size),
+        # Required by apply_vision_analysis_to_model → set_vision_spans_from_grids.
+        # Without this, vision_spans stay None and MI/TEM/SFR all no-op on OpenCUA.
+        'image_grid_thw': image_grid_thw,
+        'spatial_merge_size': int(merge_size),
     }
 
     return analysis

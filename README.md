@@ -1,172 +1,88 @@
-<div align="center">
+# STaR-KV
 
-<h1> STaR-KV: Spatio-Temporal Adaptive Re-weighting for KV Cache Compression in GUI Vision-Language Models </h1>
+KV-cache compression for GUI vision-language models, with online group mutual
+information (MI), exponential temporal discount (TEM), and exact specialist-fair
+selection (SFR). Supports UI-TARS-1.5-7B and OpenCUA-7B through FlashAttention 2
+and bfloat16.
 
-<p>
-Yuhang Han<sup>1,2*</sup>, Wenzheng Yang<sup>3*</sup>, Yujie Chen<sup>1,2</sup>, Xiangqi Jin<sup>1,2</sup>,<br>
-Yaojie Zhang<sup>1,4</sup>, Siteng Huang<sup>5</sup>, Linfeng Zhang<sup>1✉</sup>
-</p>
+![STaR-KV overview](images/main_fig.png)
 
-<p>
-<sup>1</sup> EPIC Lab, SJTU &nbsp;&nbsp;
-<sup>2</sup> HKUST (GZ) &nbsp;&nbsp;
-<sup>3</sup> The University of Sydney<br>
-<sup>4</sup> UESTC &nbsp;&nbsp;
-<sup>5</sup> ZJU
-</p>
-
-<p><sup>*</sup> Equal contribution. &nbsp;&nbsp; <sup>✉</sup> Corresponding author.</p>
-
-<h4>
-<a href="https://arxiv.org/abs/2606.01790"><img src="https://img.shields.io/badge/Paper-arXiv-red"></a>
-<a href="https://arxiv.org/pdf/2606.01790"><img src="https://img.shields.io/badge/PDF-arXiv-red"></a>
-<a href="https://github.com/kawhiiiileo/STaR-KV"><img src="https://img.shields.io/badge/Code-GitHub-blue"></a>
-</h4>
-
-</div>
-
-<p align="center">
-<img width="900" alt="STaR-KV overview" src="images/main_fig.png">
-</p>
-
-## Overview
-
-STaR-KV is a training-free KV-cache compression framework for GUI vision-language agents. It targets multi-frame GUI trajectories where visual KV cache grows rapidly with interaction steps.
-
-The method re-weights KV-cache scores with three adaptive modules:
-
-- **Online mutual-information profiling** estimates subspace-aware spatial importance for GUI visual tokens.
-- **Temporal stability discount** suppresses stale or redundant historical visual tokens while preserving stable useful evidence.
-- **Adaptive entropy-based score shaping** adjusts score sharpness before Top-K selection.
-
-This repository contains the STaR-KV runtime modules and benchmark drivers for UI-TARS / Qwen2.5-VL-style models and OpenCUA-style models.
-
-## Repository Layout
+## Layout
 
 ```text
-.
-├── starkv/                         # STaR-KV core modules
-├── eval/                           # Benchmark evaluation drivers and model patching helpers
-├── examples/
-│   ├── repro_ssp_kv.sh             # ScreenSpot-Pro reproduction script
-│   ├── starkv_local_paths.sh       # Portable path/env setup
-│   └── starkv_local_paths.env.example
-├── images/
-│   └── main_fig.png
-├── requirements.txt
-└── LICENSE.txt
+starkv/
+  starkv_mi.py             # Online spatial MI prior
+  starkv_temporal.py       # Exponential temporal stability discount
+  starkv_sfr.py            # Exact-greedy specialist-fair selection
+  starkv_group_cluster.py  # Base scoring -> MI -> TEM -> SFR -> KV gather
+  starkv_utils.py          # Compressor initialization and true vision grids
+eval/                     # Evaluators, model attention patches and timing
+examples/                 # ScreenSpot-Pro example and local paths
+images/main_fig.png       # Current MI/TEM/SFR method overview
+requirements.txt
+LICENSE.txt
 ```
 
-Model weights and benchmark datasets are not shipped with this repository.
+The three algorithm components are MI, TEM and SFR. Shared grid validation and
+cache construction live in `starkv_utils.py`; model patching and optional timing
+remain in `eval/`. SFR uses exact greedy recomputation.
 
-## Environment Setup
+Model weights, datasets and generated results are excluded. This repository
+contains the current MI → TEM → SFR implementation.
 
-The reproduction uses GPU PyTorch, FlashAttention-2, and a UI-TARS-compatible `transformers` commit.
+## Setup
 
 ```bash
 conda create -n starkv python=3.10 -y
 conda activate starkv
-
-pip install -r requirements.txt
-pip install git+https://github.com/huggingface/transformers.git@bbca9782ca1b8b358cc832a1b821aa1b450850da
-pip install flash-attn --no-build-isolation
-```
-
-If PyTorch is not already installed for your CUDA version, install the proper GPU wheel first. For example:
-
-```bash
-pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
-```
-
-## Path Configuration
-
-Configure model, dataset, and result roots with environment variables:
-
-```bash
-export STARKV_MODEL_DIR=/path/to/models
-export STARKV_DATASETS_DIR=/path/to/datasets
-export STARKV_RESULTS_DIR=/path/to/results
-source examples/starkv_local_paths.sh
-```
-
-Expected default model and dataset paths after sourcing `examples/starkv_local_paths.sh`:
-
-```text
-$STARKV_MODEL_DIR/UI-TARS-1.5-7B
-$STARKV_MODEL_DIR/OpenCUA-7B
-$STARKV_DATASETS_DIR/ScreenSpot-Pro/images
-$STARKV_DATASETS_DIR/ScreenSpot-Pro/annotations
-```
-
-For persistent local overrides, copy the example env file and edit it:
-
-```bash
+pip install torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
+PIP_NO_BUILD_ISOLATION=1 pip install -r requirements.txt
 cp examples/starkv_local_paths.env.example examples/starkv_local_paths.env
 ```
 
-`examples/starkv_local_paths.env` is gitignored.
+Edit the copied file with your Python executable, model and dataset paths.
+The local configuration file is gitignored.
 
-## Sanity Check
+## ScreenSpot-Pro
 
-Run the lightweight helper check before launching full evaluation:
-
-```bash
-conda activate starkv
-source examples/starkv_local_paths.sh
-PYTHONPATH="eval:starkv" python eval/attention_helpers.py
-```
-
-## Reproduce ScreenSpot-Pro Results
-
-The provided reproduction script evaluates **UI-TARS-1.5-7B** on full **ScreenSpot-Pro** with `task=all`, `flash_attention_2`, and `bfloat16`.
+Run UI-TARS-1.5-7B on all ScreenSpot-Pro samples:
 
 ```bash
-source examples/starkv_local_paths.sh
+GPU=0 BUDGET=40 bash examples/repro_ssp_kv.sh
+# Multiple budgets, evaluated sequentially on the selected GPU:
 GPU=0 BUDGETS="10 20" bash examples/repro_ssp_kv.sh
 ```
 
-`BUDGET` / `BUDGETS` controls `--kv_cache_budget`, the retained KV-cache percentage. For example, `BUDGET=20` keeps about 20% of the full cache before appending the always-kept recent window.
+Budgets are total retained prefill KV percentages (5, 10, 20 or 40), including
+an 8-token recent window (`total_including_window`). For full length `L`, the
+total capacity is `C = min(L, max(1, floor(L * budget / 100)))`, the effective
+window is `W = min(8, C)`, and SFR selects `B = C - W` historical tokens.
+For example, 20% of 2500 tokens retains 492 historical + 8 recent = 500 tokens.
+If `C <= 8`, only the most recent `C` tokens are kept; 100% keeps the full cache.
+The ratio applies immediately after prefill compression; subsequent decode
+tokens append normally. Use a fresh results directory for this budget protocol.
+The configured window is restored for each prompt, even after a tiny budget.
+The example fixes native GQA `group_mean`,
+online group MI (`lambda=0.5`), exponential TEM (`delta=0.2`, `rho=0.9`,
+`discount_min=0.1`), and exact SFR (`lambda=0.3`) with TEM-aware coverage.
+Single-image ScreenSpot-Pro does not exercise cross-frame temporal discount.
 
-For exact reproduction settings, see `examples/repro_ssp_kv.sh`.
+Each run writes its command, log, detailed predictions and summary under
+`outputs/repro_ssp_<timestamp>/starkv_b<budget>/`. Set `RESULTS_BASE` to choose
+another output directory. Read accuracy from `screenspotpro_summary_results.json`.
 
-Reference ScreenSpot-Pro accuracy with `examples/repro_ssp_kv.sh`:
+## Other benchmarks
 
-| Budget | 10% | 20% |
-| --- | ---: | ---: |
-| Overall | 37.7 | 40.9 |
+The same runtime is used by:
 
-Outputs are written to:
+- `eval/screenspotv2_eval.py`
+- `eval/androidcontrol_eval.py`
+- `eval/agentnetbench_eval.py`
 
-```text
-$STARKV_RESULTS_DIR/repro_ssp_kv/starkv_b{budget}/screenspotpro_summary_results.json
-```
-
-## Other Benchmarks
-
-The same STaR-KV runtime flags can be passed to the other evaluation drivers:
-
-```text
-eval/screenspotv2_eval.py
-eval/androidcontrol_eval.py
-eval/agentnetbench_eval.py
-```
-
-Use `--kv_cache original` for full-cache evaluation and `--kv_cache starkv` for STaR-KV compression.
-
-## Citation
-
-```bibtex
-@misc{han2026starkv,
-  title={STaR-KV: Spatio-Temporal Adaptive Re-weighting for KV Cache Compression in GUI Vision-Language Models},
-  author={Han, Yuhang and Yang, Wenzheng and Chen, Yujie and Jin, Xiangqi and Zhang, Yaojie and Huang, Siteng and Zhang, Linfeng},
-  year={2026},
-  eprint={2606.01790},
-  archivePrefix={arXiv},
-  primaryClass={cs.CV},
-  doi={10.48550/arXiv.2606.01790},
-  url={https://arxiv.org/abs/2606.01790}
-}
-```
+Run a driver with `--help` to inspect dataset and model arguments. Use
+`--kv_cache starkv` for compression or `--kv_cache original` for Full Cache.
+For multi-frame evaluation, AndroidControl uses history frames and 5 image slots;
+AgentNetBench uses 5 image slots and OpenCUA's `current_images` protocol.
 
 ## License
 

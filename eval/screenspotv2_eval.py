@@ -17,6 +17,8 @@ from ui_tars_utils import (
     analyze_vision_tokens_multi_images
 )
 from attention_helpers import (
+    add_flash_attention_2_argument,
+    require_flash_attention_2,
     replace_qwen2_5_vl,
     replace_opencua,
     set_attention_implementation,
@@ -24,12 +26,13 @@ from attention_helpers import (
     set_kv_cache_budget,
     set_move_attention_to_cpu,
     set_vision_start_idx,
+    apply_vision_analysis_to_model,
     set_vision_end_idx,
     set_temperature,
     set_alpha,
     set_window_size,
-    apply_entropy_budget_runtime,
-    collect_entropy_budget_stats,
+    collect_temporal_diagnostics_from_model,
+    collect_original_mi_diagnostics_from_model,
     reset_gpu_memory_stats,
     collect_gpu_memory_stats,
     reset_starkv_per_sample_state,
@@ -38,6 +41,9 @@ from attention_helpers import (
     compute_kv_cache_memory_summary,
     set_starkv_group_config,
     is_starkv_kv,
+    is_compressed_kv,
+    needs_vision_spans,
+    set_kv_cache_mode,
 )
 from attention_helpers import add_starkv_kv_arguments, finalize_starkv_args
 from eval_paths import (
@@ -82,14 +88,13 @@ if __name__ == '__main__':
     parser.add_argument('--max_new_tokens', type=int, default=200)
     parser.add_argument('--device', type=str, default=None, help='Device to use (cuda/mps/cpu). If not specified, will auto-detect best available device.')
     parser.add_argument('--model_dtype', type=str, default="auto", choices=["auto", "bfloat16", "float16", "float32"], help='Data type to use (auto/bfloat16/float16/float32).')
-    parser.add_argument('--attention_implementation', type=str, default="eager", choices=["eager", "sdpa", "flash_attention_2"], help='Attention implementation to use (eager/flash_attention_2).')
+    add_flash_attention_2_argument(parser)
     add_starkv_kv_arguments(
         parser,
         kv_cache_budget_default=100,
         kv_cache_budget_type=int,
         temperature_default=1.0,
         alpha_default=None,
-        include_mi_granularity=True,
     )
     add_results_dir_argument(parser)
     args = parser.parse_args()
@@ -98,12 +103,9 @@ if __name__ == '__main__':
 
     print(
         "[ScreenSpot-v2 config]",
-        f"kv_cache={args.kv_cache}",
-        f"kv_group_selection_mode={args.kv_group_selection_mode}",
-        f"kv_cache_budget={args.kv_cache_budget}",
-        f"kv_group_soft_prior_lambda={args.kv_group_soft_prior_lambda}",
-        f"kv_group_soft_prior_source={args.kv_group_soft_prior_source}",
-        f"kv_group_online_profile_steps={args.kv_group_online_profile_steps}",
+        f"kv_cache={args.kv_cache}",        f"kv_cache_budget={args.kv_cache_budget}",
+        f"kv_group_soft_prior_lambda={getattr(args, 'kv_group_soft_prior_lambda', None)}",
+        f"kv_group_mi_mode={getattr(args, 'kv_group_mi_mode', None)}",
         f"temporal_enable={bool(getattr(args, 'kv_group_temporal_enable', False))}",
         f"alpha={args.alpha}",
         f"temperature={args.temperature}",
@@ -137,13 +139,30 @@ if __name__ == '__main__':
         print(f"Device validation error: {e}. Using CPU as fallback.")
         device = "cpu"
 
+    require_flash_attention_2(args, device)
+
     model_path = args.model_path
     print("model_path: ", model_path)
+    # Processor from local model_path only (no HuggingFace hub).
     if "OpenCUA" in args.model_path:
-        processor = AutoProcessor.from_pretrained(args.model_path, trust_remote_code=True)
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        processor = AutoProcessor.from_pretrained(
+            args.model_path, trust_remote_code=True, local_files_only=True, use_fast=False
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_path, trust_remote_code=True, local_files_only=True
+        )
     else:
-        processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct", min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS)
+        processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=True, local_files_only=True, use_fast=False
+        )
+        ip = getattr(processor, "image_processor", None)
+        if ip is not None and getattr(ip, "min_pixels", None) is not None:
+            MIN_PIXELS = int(ip.min_pixels)
+            MAX_PIXELS = int(ip.max_pixels)
+        print(
+            f"UI-TARS/Qwen processor from {model_path}; "
+            f"min_pixels={MIN_PIXELS}, max_pixels={MAX_PIXELS}"
+        )
     if args.model_dtype == "float32":
         model_dtype = torch.float32
     elif args.model_dtype == "bfloat16":
@@ -176,9 +195,10 @@ if __name__ == '__main__':
             )
         set_attention_implementation(model, args)
         set_kv_cache_budget(model, args)
+        if is_compressed_kv(args.kv_cache):
+            set_kv_cache_mode(model, args)
         if is_starkv_kv(args.kv_cache):
             set_starkv_group_config(model, args)
-        apply_entropy_budget_runtime(model, args)
         reset_gpu_memory_stats()
         reset_kv_cache_stats()
         if args.attention_implementation == "eager":
@@ -203,9 +223,10 @@ if __name__ == '__main__':
             )
         set_attention_implementation(model, args)
         set_kv_cache_budget(model, args)
+        if is_compressed_kv(args.kv_cache):
+            set_kv_cache_mode(model, args)
         if is_starkv_kv(args.kv_cache):
             set_starkv_group_config(model, args)
-        apply_entropy_budget_runtime(model, args)
         reset_gpu_memory_stats()
         reset_kv_cache_stats()
         if args.attention_implementation == "eager":
@@ -296,16 +317,15 @@ if __name__ == '__main__':
                 )
                 inputs = inputs.to(device)
 
-            if is_starkv_kv(args.kv_cache):
+            if needs_vision_spans(args.kv_cache):
                 if "UI-TARS" in args.model_path:
                     vision_analysis = analyze_vision_tokens_multi_images(processor, image_inputs, video_inputs, text, image_count=1)
                 elif "OpenCUA" in args.model_path:
                     vision_analysis = analyze_vision_tokens_opencua_multi_images(tokenizer, inputs["input_ids"], image_grid_thw=inputs["image_grid_thw"], merge_size=2, image_count=1)
 
             set_window_size(model, args)
-            if is_starkv_kv(args.kv_cache):
-                set_vision_start_idx(model, vision_analysis['vision_start_idx'], args)
-                set_vision_end_idx(model, vision_analysis['vision_end_idx'], args)
+            if needs_vision_spans(args.kv_cache):
+                apply_vision_analysis_to_model(model, vision_analysis, args)
                 if args.alpha is not None:
                     set_alpha(model, args)
                     set_temperature(model, args)
@@ -343,10 +363,9 @@ if __name__ == '__main__':
                     )[0]
             except Exception as e:
                 print(f"Error in generation: {e}")
-                print("Using outputs from the previous iteration")
-                if "OpenCUA" not in args.model_path:
-                    generated_ids = outputs if not hasattr(outputs, 'sequences') else outputs.sequences
-                continue
+                raise RuntimeError(
+                    "Generation failed; refusing to continue with a partial or stale-output evaluation."
+                ) from e
 
             print("output_text: ", output_text)
 
@@ -437,12 +456,8 @@ if __name__ == '__main__':
     logging.info(f"Saved detailed results to {detailed_results_path}")
 
     temporal_discount_debug = None
-    if "UI-TARS" in args.model_path:
-        try:
-            sa = model.model.language_model.layers[0].self_attn
-            temporal_discount_debug = getattr(sa, "kv_group_temporal_last_stats", None)
-        except Exception:
-            temporal_discount_debug = None
+    if bool(getattr(args, "kv_group_temporal_enable", False)) and is_starkv_kv(args.kv_cache):
+        temporal_discount_debug = collect_temporal_diagnostics_from_model(model, args.model_path)
 
     summary_results = {
         "model_path": args.model_path,
@@ -454,16 +469,18 @@ if __name__ == '__main__':
         "icon_accuracy": avg_icon_acc,
         "kv_cache": args.kv_cache,
         "kv_cache_budget": args.kv_cache_budget,
-        "kv_group_selection_mode": getattr(args, "kv_group_selection_mode", "soft_global"),
         "kv_group_soft_prior_lambda": getattr(args, "kv_group_soft_prior_lambda", None),
-        "kv_group_soft_prior_source": getattr(args, "kv_group_soft_prior_source", None),
-        "kv_group_mi_saliency_weight": getattr(args, "kv_group_mi_saliency_weight", None),
-        "kv_group_token_spatial_beta": getattr(args, "kv_group_token_spatial_beta", None),
-        "kv_group_token_spatial_scale": getattr(args, "kv_group_token_spatial_scale", None),
-        "kv_group_online_profile_steps": getattr(args, "kv_group_online_profile_steps", None),
         "kv_group_online_profile_decay": getattr(args, "kv_group_online_profile_decay", None),
         "kv_group_online_profile_tau": getattr(args, "kv_group_online_profile_tau", None),
-        "kv_group_online_profile_lambda_ramp_steps": getattr(args, "kv_group_online_profile_lambda_ramp_steps", None),
+        "original_mi_debug": collect_original_mi_diagnostics_from_model(
+            model, args.model_path
+        ) if args.kv_cache == "starkv" else None,
+        "kv_group_mi_mode": getattr(args, "kv_group_mi_mode", None),
+        "kv_group_mi_reliability_gamma": getattr(args, "kv_group_mi_reliability_gamma", None),
+        "kv_group_mi_routing_tau": getattr(args, "kv_group_mi_routing_tau", None),
+        "kv_group_mi_candidate_multiplier": getattr(args, "kv_group_mi_candidate_multiplier", None),
+        "kv_group_mi_positive_only": bool(getattr(args, "kv_group_mi_positive_only", True)),
+        "kv_group_mi_max_multiplier": getattr(args, "kv_group_mi_max_multiplier", None),
         "kv_group_temporal_enable": bool(getattr(args, "kv_group_temporal_enable", False)),
         "kv_group_temporal_rho": getattr(args, "kv_group_temporal_rho", None),
         "kv_group_temporal_delta": getattr(args, "kv_group_temporal_delta", None),
@@ -472,17 +489,9 @@ if __name__ == '__main__':
         "kv_group_temporal_warmup_steps": getattr(args, "kv_group_temporal_warmup_steps", None),
         "kv_group_temporal_debug": bool(getattr(args, "kv_group_temporal_debug", False)),
         "temporal_discount_debug": temporal_discount_debug,
-        "entropy_budget_enable": bool(getattr(args, "kv_entropy_budget_enable", False)),
-        "entropy_budget_active": bool(getattr(args, "kv_entropy_budget_enable", False) and is_starkv_kv(getattr(args, "kv_cache", None))),
-        "entropy_budget_skipped_reason": (
-            "AEB applies only when --kv_cache starkv."
-            if (bool(getattr(args, "kv_entropy_budget_enable", False)) and not is_starkv_kv(getattr(args, "kv_cache", None)))
-            else None
-        ),
         "gpu_memory_stats": collect_gpu_memory_stats(),
         "kv_cache_stats": compute_kv_cache_memory_summary(collect_kv_cache_stats()),
         "eval_duration_seconds": round(time.time() - eval_start_time, 2),
-        "entropy_budget_debug": collect_entropy_budget_stats(model, args),
         "screenspot_temporal_note": "Single-image benchmark; temporal discount is a no-op (num_visual_spans <= 1).",
         "alpha": getattr(args, "alpha", None),
         "temperature": getattr(args, "temperature", None),

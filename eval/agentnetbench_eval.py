@@ -32,21 +32,26 @@ from ui_tars_utils import (
 )
 
 from attention_helpers import (
+    add_flash_attention_2_argument,
+    require_flash_attention_2,
     replace_qwen2_5_vl,
     replace_opencua,
     set_attention_implementation,
     configure_accelerate_skip_attention,
     set_kv_cache_budget,
     set_vision_start_idx,
+    apply_vision_analysis_to_model,
     set_vision_end_idx,
     set_alpha,
     set_window_size,
     set_move_attention_to_cpu,
     set_temperature,
-    apply_entropy_budget_runtime,
     reset_starkv_per_sample_state,
     set_starkv_group_config,
     is_starkv_kv,
+    is_compressed_kv,
+    needs_vision_spans,
+    set_kv_cache_mode,
     add_starkv_kv_arguments,
     finalize_starkv_args,
     reset_gpu_memory_stats,
@@ -54,12 +59,18 @@ from attention_helpers import (
     reset_kv_cache_stats,
     collect_kv_cache_stats,
     compute_kv_cache_memory_summary,
-    collect_entropy_budget_stats,
+    collect_temporal_diagnostics_from_model,
+    timed_generate,
+    reset_runtime_metrics,
+    collect_runtime_metrics,
+    RUNTIME_METRICS,
 )
 from eval_paths import (
     add_model_path_argument,
     add_results_dir_argument,
     add_agentnetbench_dataset_args,
+    normalize_agentnetbench_img_root,
+    resolve_agentnetbench_image_path,
     validate_required_paths,
     resolve_opencua_model_path,
 )
@@ -132,9 +143,49 @@ OPENCUA_SYSTEM_PROMPT = """You are a GUI agent. You are given a task and a scree
 Return only ONE line of pyautogui code or computer.terminate. No markdown. No explanation.
 """
 
-AGENTNETBENCH_PROMPT_OPENCUA = """Task: {instruction}
+AGENTNETBENCH_PROMPT_OPENCUA_MINIMAL = """Task: {instruction}
 
 Please generate the next move according to the screenshot and task instruction."""
+
+AGENTNETBENCH_PROMPT_OPENCUA_PAPER = """You are a GUI agent. You are given a task and a screenshot of the screen. You need to perform a series of pyautogui actions to complete the task.
+
+For each step, provide your response in this format:
+
+Thought:
+  - Step by Step Progress Assessment:
+    - Analyze completed task parts and their contribution to the overall goal
+    - Reflect on potential errors, unexpected results, or obstacles
+    - If previous action was incorrect, predict a logical recovery step
+  - Next Action Analysis:
+    - List possible next actions based on current state
+    - Evaluate options considering current state and previous actions
+    - Propose most logical next action
+    - Anticipate consequences of the proposed action
+  - For Text Input Actions:
+    - Note current cursor position
+    - Consolidate repetitive actions (specify count for multiple keypresses)
+    - Describe expected final text outcome
+    - Use first-person perspective in reasoning
+Action:
+  Provide clear, concise, and actionable instructions:
+  - If the action involves interacting with a specific target:
+    - Describe target explicitly without using coordinates
+    - Specify element names when possible (use original language if non-English)
+    - Describe features (shape, color, position) if name unavailable
+    - For window control buttons, identify correctly (minimize "—", maximize "□", close "X")
+  - if the action involves keyboard actions like 'press', 'write', 'hotkey':
+    - Consolidate repetitive keypresses with count
+    - Specify expected text outcome for typing actions
+
+Finally, output the action as PyAutoGUI code or the following functions:
+- {{"name": "computer.triple_click", "description": "Triple click on the screen", "parameters": {{"type": "object", "properties": {{"x": {{"type": "number", "description": "The x coordinate of the triple click"}}, "y": {{"type": "number", "description": "The y coordinate of the triple click"}}}}, "required": ["x", "y"]}}}}
+- {{"name": "computer.terminate", "description": "Terminate the current task and report its completion status", "parameters": {{"type": "object", "properties": {{"status": {{"type": "string", "enum": ["success", "failure"], "description": "The status of the task"}}}}, "required": ["status"]}}}}
+
+# Task Instruction:
+{instruction}
+
+Please generate the next move according to the screenshot and task instruction.
+"""
 
 def evaluate_action(pred_action, gt_action, alternative_options=None):
     """
@@ -383,25 +434,31 @@ if __name__ == '__main__':
     add_agentnetbench_dataset_args(parser)
     parser.add_argument('--task', type=str, default="all", choices=["all"])
     parser.add_argument('--debug', default=None, type=int)
+    parser.add_argument('--sample_offset', default=0, type=int,
+                        help='Skip the first N sorted trajectories (held-out calibration).')
     parser.add_argument('--max_new_tokens', type=int, default=1000)
     parser.add_argument('--device', type=str, default=None, help='Device to use (cuda/mps/cpu). If not specified, will auto-detect best available device.')
     parser.add_argument('--model_dtype', type=str, default="bfloat16", choices=["auto", "bfloat16", "float16", "float32"], help='Data type to use (auto/bfloat16/float16/float32).')
-    parser.add_argument('--attention_implementation', type=str, default="flash_attention_2", choices=["eager", "sdpa", "flash_attention_2"], help='Attention implementation to use (eager/flash_attention_2).')
+    add_flash_attention_2_argument(parser)
     add_starkv_kv_arguments(
         parser,
         kv_cache_default="starkv",
         kv_cache_budget_default=20,
-        soft_prior_source_default="mi_saliency",
-        online_profile_steps_default=5,
-        online_profile_lambda_ramp_default=10,
-        temporal_warmup_default=0,
         temporal_enable_action="boolean_optional",
-        aeb_enable_action="boolean_optional",
-        aeb_min_scale_default=0.95,
-        aeb_max_scale_default=1.05,
     )
     add_results_dir_argument(parser)
     parser.add_argument('--image_slots', type=int, default=5, help='Number of previous images to include in context')
+    parser.add_argument(
+        '--opencua_anb_protocol',
+        choices=('current_images', 'single_frame', 'paper_history'),
+        default='current_images',
+        help=(
+            'OpenCUA AgentNetBench context protocol: current_images keeps the '
+            'existing screenshot-only history; single_frame uses only the current '
+            'screenshot; paper_history uses corrected screenshot/action pairs and '
+            'the released paper prompt.'
+        ),
+    )
     parser.add_argument(
         '--opencua_legacy_prompts',
         action=argparse.BooleanOptionalAction,
@@ -413,22 +470,22 @@ if __name__ == '__main__':
     parser.add_argument('--chunk_id', type=int, default=0, help='Which chunk (0-indexed) this process handles.')
     args = parser.parse_args()
     validate_required_paths(args, ("model_path", "agentnetbench_data", "agentnetbench_imgs"))
+    normalize_agentnetbench_img_root(args)
     resolve_opencua_model_path(args)
+    # Keep False so --no-kv_group_temporal_enable works for TEM ablations.
     finalize_starkv_args(
         args,
-        force_full_starkv_stack=is_starkv_kv(args.kv_cache),
         disable_starkv_extras_for_original=True,
     )
 
     print(
         "[AgentNetBench config]",
         f"kv_cache={args.kv_cache}",
-        f"selection_mode={args.kv_group_selection_mode}",
+        f"baseline_gqa_mode={args.baseline_gqa_mode}",
+        f"opencua_anb_protocol={args.opencua_anb_protocol}",
         f"budget={args.kv_cache_budget}",
-        f"soft_lambda={args.kv_group_soft_prior_lambda}",
-        f"online(N,decay,tau,ramp)=({args.kv_group_online_profile_steps},{args.kv_group_online_profile_decay},{args.kv_group_online_profile_tau},{args.kv_group_online_profile_lambda_ramp_steps})",
-        f"temporal={bool(args.kv_group_temporal_enable)}",
-        f"aeb={bool(args.kv_entropy_budget_enable)}",
+        f"soft_lambda={getattr(args, 'kv_group_soft_prior_lambda', None)}",        f"online(decay,tau)=({getattr(args, 'kv_group_online_profile_decay', None)},{getattr(args, 'kv_group_online_profile_tau', None)})",
+        f"temporal={bool(getattr(args, 'kv_group_temporal_enable', False))}",
         f"alpha={args.alpha} temp={args.temperature} win={args.window_size}",
         f"FA={args.attention_implementation} dtype={args.model_dtype} max_new_tokens={args.max_new_tokens}",
         sep=" | ",
@@ -459,19 +516,40 @@ if __name__ == '__main__':
         print(f"Device validation error: {e}. Using CPU as fallback.")
         device = "cpu"
 
+    require_flash_attention_2(args, device)
+
     # use Qwen-VL-Chat
     model_path = args.model_path
     print("model_path: ", model_path)
     
+    # Load processor from local model_path (same as androidcontrol_eval). Do NOT hit HuggingFace.
+    eval_min_pixels, eval_max_pixels = MIN_PIXELS, MAX_PIXELS
     if "UI-TARS" in args.model_path:
-        processor = AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-7B-Instruct", min_pixels=MIN_PIXELS, max_pixels=MAX_PIXELS)
+        processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=True, local_files_only=True, use_fast=False
+        )
+        ip = getattr(processor, "image_processor", None)
+        if ip is not None and getattr(ip, "min_pixels", None) is not None:
+            eval_min_pixels = int(ip.min_pixels)
+            eval_max_pixels = int(ip.max_pixels)
+        print(
+            f"UI-TARS processor from {model_path}; "
+            f"parse/decode min_pixels={eval_min_pixels}, max_pixels={eval_max_pixels}"
+        )
         tokenizer = None  # Not needed for UI-TARS
     elif "opencua" in args.model_path.lower():
-        processor = AutoImageProcessor.from_pretrained(args.model_path, trust_remote_code=True)
-        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        processor = AutoImageProcessor.from_pretrained(
+            args.model_path, trust_remote_code=True, local_files_only=True, use_fast=False
+        )
+        tokenizer = AutoTokenizer.from_pretrained(
+            args.model_path, trust_remote_code=True, local_files_only=True
+        )
     else:
         raise NotImplementedError(f"Model {args.model_path} not implemented")
-        
+
+    # Keep module-level names used later in this script in sync with local preprocessor.
+    MIN_PIXELS, MAX_PIXELS = eval_min_pixels, eval_max_pixels
+
     
     if args.model_dtype == "float32":
         model_dtype = torch.float32
@@ -510,9 +588,10 @@ if __name__ == '__main__':
             )
         set_attention_implementation(model, args)
         set_kv_cache_budget(model, args)
+        if is_compressed_kv(args.kv_cache):
+            set_kv_cache_mode(model, args)
         if is_starkv_kv(args.kv_cache):
             set_starkv_group_config(model, args)
-        apply_entropy_budget_runtime(model, args)
         reset_gpu_memory_stats()
         reset_kv_cache_stats()
         if args.attention_implementation == "eager":
@@ -542,9 +621,10 @@ if __name__ == '__main__':
             )
         set_attention_implementation(model, args)
         set_kv_cache_budget(model, args)
+        if is_compressed_kv(args.kv_cache):
+            set_kv_cache_mode(model, args)
         if is_starkv_kv(args.kv_cache):
             set_starkv_group_config(model, args)
-        apply_entropy_budget_runtime(model, args)
         reset_gpu_memory_stats()
         reset_kv_cache_stats()
         if args.attention_implementation == "eager":
@@ -556,8 +636,19 @@ if __name__ == '__main__':
     run_start_time = time.time()
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
+    if getattr(args, "runtime_metrics", False):
+        reset_runtime_metrics()
+        RUNTIME_METRICS.set_warmup_samples(
+            int(os.environ.get("STARKV_RUNTIME_WARMUP_SAMPLES", "5"))
+        )
+        RUNTIME_METRICS.mark_run_start()
 
     trajectory_files = sorted([f for f in os.listdir(args.agentnetbench_data) if f.endswith('.json') and not f.startswith('mapping')])
+
+    sample_offset = max(0, int(getattr(args, "sample_offset", 0) or 0))
+    if sample_offset:
+        trajectory_files = trajectory_files[sample_offset:]
+        print(f"Sample offset: skipped first {sample_offset} sorted trajectories")
 
     # Chunk data across GPUs
     total_trajs = len(trajectory_files)
@@ -608,15 +699,21 @@ if __name__ == '__main__':
 
         if task_id not in trajectory_histories:
             trajectory_histories[task_id] = {}
-
-        reset_starkv_per_sample_state(model, args)
+        if getattr(args, "kv_cache", None) == "starkv":
+            reset_starkv_per_sample_state(model, args)
 
         for step_idx, step in enumerate(steps):
+            _runtime_step_t0 = time.perf_counter()
+            _runtime_latency = None
+            # Paper MI/TEM state persists across steps within a trajectory.
+            if getattr(args, "kv_cache", None) != "starkv":
+                reset_starkv_per_sample_state(model, args)
+
             total_steps += 1
             trajectory_step_count += 1
 
             img_filename = step['image']
-            img_path = os.path.join(args.agentnetbench_imgs, img_filename)
+            img_path = resolve_agentnetbench_image_path(args.agentnetbench_imgs, img_filename)
             
             if not os.path.exists(img_path):
                 print(f"Image not found: {img_path}")
@@ -634,11 +731,56 @@ if __name__ == '__main__':
             prev_indices = list(range(0, step_idx))
 
             if "opencua" in args.model_path.lower():
-                # OpenCUA: single-turn per step (multi-turn history hurts quality on this stack).
-                if getattr(args, "opencua_legacy_prompts", True):
+                protocol = args.opencua_anb_protocol
+                if protocol != "paper_history" and getattr(args, "opencua_legacy_prompts", True):
                     messages.append({"role": "system", "content": OPENCUA_SYSTEM_PROMPT})
 
-                user_prompt = AGENTNETBENCH_PROMPT_OPENCUA.format(instruction=instruction)
+                if protocol != "single_frame":
+                    image_slots = min(args.image_slots - 1, len(prev_indices))
+                    indices_with_images = set(
+                        prev_indices[-image_slots:] if image_slots > 0 else []
+                    )
+                    history_indices = (
+                        prev_indices
+                        if protocol == "paper_history"
+                        else [i for i in prev_indices if i in indices_with_images]
+                    )
+                    for hist_idx in history_indices:
+                        hist_step = steps[hist_idx]
+                        if hist_idx in indices_with_images:
+                            hist_img_path = resolve_agentnetbench_image_path(
+                                args.agentnetbench_imgs, hist_step['image']
+                            )
+                            messages.append({
+                                "role": "user",
+                                "content": [{"type": "image", "image": hist_img_path}],
+                            })
+
+                        if (
+                            protocol == "paper_history"
+                            and hist_idx >= max(0, step_idx - max_history_length)
+                        ):
+                            history_text = trajectory_histories[task_id].get(hist_idx)
+                            if history_text is None:
+                                inner_monologue = hist_step.get('inner_monologue', {})
+                                history_text = RESPONSE_TEMPLATE.format(
+                                    observation=inner_monologue.get('observation', ''),
+                                    thought=inner_monologue.get('thought', ''),
+                                    action=inner_monologue.get('low_level_instruction', ''),
+                                    code=hist_step.get('action', ''),
+                                )
+                            messages.append({
+                                "role": "assistant",
+                                "content": STEP_TEMPLATE.format(step_num=hist_idx + 1)
+                                + history_text,
+                            })
+
+                prompt_template = (
+                    AGENTNETBENCH_PROMPT_OPENCUA_PAPER
+                    if protocol == "paper_history"
+                    else AGENTNETBENCH_PROMPT_OPENCUA_MINIMAL
+                )
+                user_prompt = prompt_template.format(instruction=instruction)
                 messages.append({
                     "role": "user",
                     "content": [
@@ -656,7 +798,9 @@ if __name__ == '__main__':
                     include_image = hist_idx in indices_with_images
 
                     if include_image:
-                        hist_img_path = os.path.join(args.agentnetbench_imgs, hist_step['image'])
+                        hist_img_path = resolve_agentnetbench_image_path(
+                            args.agentnetbench_imgs, hist_step['image']
+                        )
                         messages.append({
                             "role": "user",
                             "content": [
@@ -757,7 +901,7 @@ if __name__ == '__main__':
             else:
                 raise NotImplementedError(f"Model {args.model_path} not implemented")
 
-            if is_starkv_kv(args.kv_cache):
+            if needs_vision_spans(args.kv_cache):
                 num_images = sum(1 for msg in messages if msg.get("role") == "user" and isinstance(msg.get("content"), list) and any(content_item.get("type") == "image" for content_item in msg["content"]))
                 if "UI-TARS" in args.model_path:
                     vision_analysis = analyze_vision_tokens_multi_images(processor, image_inputs, video_inputs, text, image_count=num_images)
@@ -766,21 +910,53 @@ if __name__ == '__main__':
                 else:
                     raise NotImplementedError(f"Model {args.model_path} not implemented")
             set_window_size(model, args)
-            if is_starkv_kv(args.kv_cache):
-                set_vision_start_idx(model, vision_analysis['vision_start_idx'], args)
-                set_vision_end_idx(model, vision_analysis['vision_end_idx'], args)
+            if needs_vision_spans(args.kv_cache):
+                apply_vision_analysis_to_model(model, vision_analysis, args)
                 if args.alpha is not None:
                     set_alpha(model, args)
                     set_temperature(model, args)
+                if step_idx < 2 or trajectory_step_count <= 2:
+                    nspan = len(vision_analysis.get("vision_start_idx") or [])
+                    grids = vision_analysis.get("image_grid_thw")
+                    print(
+                        f"[vision debug] task={task_id} step={step_idx} n_images={num_images} "
+                        f"n_spans={nspan} grids={grids}"
+                    )
+                    try:
+                        from attention_helpers import iter_language_model_layers
+                        _layers = iter_language_model_layers(model, args.model_path)
+                        sa0 = _layers[0].self_attn if _layers else None
+                    except Exception as _e:
+                        sa0 = None
+                        print(f"[vision debug] layer resolve failed: {_e}")
+                    if sa0 is not None:
+                        print(
+                            f"[vision debug] model spans={getattr(sa0, 'vision_spans', None)} "
+                            f"err={getattr(sa0, 'vision_spans_error', None)}"
+                        )
 
             if "UI-TARS" in args.model_path:
-                outputs = model.generate(**inputs, 
-                                    max_new_tokens=args.max_new_tokens, 
-                                    pad_token_id=processor.tokenizer.eos_token_id,
-                                    output_attentions=False,
-                                    use_cache=True,
-                                    do_sample=False,
-                                    return_dict_in_generate=True)
+                generate_kwargs = dict(
+                    **inputs,
+                    max_new_tokens=args.max_new_tokens,
+                    pad_token_id=processor.tokenizer.eos_token_id,
+                    output_attentions=False,
+                    use_cache=True,
+                    do_sample=False,
+                    return_dict_in_generate=True,
+                )
+                if getattr(args, "runtime_metrics", False):
+                    outputs, _ = timed_generate(
+                        model,
+                        synchronize_cuda=bool(
+                            getattr(args, "runtime_metrics_sync_cuda", True)
+                        ),
+                        record=False,
+                        **generate_kwargs,
+                    )
+                    _runtime_latency = _
+                else:
+                    outputs = model.generate(**generate_kwargs)
                 
                 generated_ids = outputs if not hasattr(outputs, 'sequences') else outputs.sequences
                 
@@ -802,7 +978,18 @@ if __name__ == '__main__':
                 )
                 if grid_thws is not None:
                     generate_kwargs["image_grid_thw"] = grid_thws
-                generated_ids = model.generate(**generate_kwargs)
+                if getattr(args, "runtime_metrics", False):
+                    generated_ids, _ = timed_generate(
+                        model,
+                        synchronize_cuda=bool(
+                            getattr(args, "runtime_metrics_sync_cuda", True)
+                        ),
+                        record=False,
+                        **generate_kwargs,
+                    )
+                    _runtime_latency = _
+                else:
+                    generated_ids = model.generate(**generate_kwargs)
                 
                 prompt_len = input_ids.shape[1]
                 generated_ids = generated_ids[:, prompt_len:]
@@ -811,13 +998,60 @@ if __name__ == '__main__':
                 )[0]
             else:
                 raise NotImplementedError(f"Model {args.model_path} not implemented")
-                
+
+            if is_starkv_kv(args.kv_cache) and bool(getattr(args, "kv_group_temporal_enable", False)):
+                if step_idx < 2 or trajectory_step_count <= 2:
+                    try:
+                        tem_diag = collect_temporal_diagnostics_from_model(model, args.model_path)
+                        print(
+                            f"[TEM debug] task={task_id} step={step_idx} "
+                            f"layers_applied={tem_diag.get('tem_layers_applied')} "
+                            f"reasons={tem_diag.get('tem_reason_counts')}"
+                        )
+                    except Exception as tem_err:
+                        print(f"[TEM debug] collect failed: {tem_err}")
+
             print("output_text: ", output_text)
+
+            if getattr(args, "runtime_metrics", False) and _runtime_latency is not None:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                _runtime_num_images = sum(
+                    1
+                    for msg in messages
+                    if msg.get("role") == "user"
+                    and isinstance(msg.get("content"), list)
+                    for ci in msg["content"]
+                    if ci.get("type") == "image"
+                )
+                try:
+                    _input_tokens = int(
+                        inputs.input_ids.shape[-1]
+                        if "UI-TARS" in args.model_path else input_ids.shape[-1]
+                    )
+                except Exception:
+                    _input_tokens = None
+                RUNTIME_METRICS.record_sample(
+                    _runtime_latency,
+                    extra={
+                        "step_e2e_s": round(time.perf_counter() - _runtime_step_t0, 6),
+                        "num_images": int(_runtime_num_images),
+                        "history_frames": max(0, int(_runtime_num_images) - 1),
+                        "input_tokens": _input_tokens,
+                    },
+                )
 
             if "UI-TARS" in args.model_path:
                 formatted_response = f"Step {step_idx + 1}:\n{output_text}"
                 trajectory_histories[task_id][step_idx] = formatted_response
-            # OpenCUA uses ground truth for all history; no need to store predictions
+            elif (
+                "opencua" in args.model_path.lower()
+                and args.opencua_anb_protocol == "paper_history"
+            ):
+                # The released evaluator carries the model response into the next
+                # step. Store the raw response; STEP_TEMPLATE is added exactly once
+                # when constructing the following prompt.
+                trajectory_histories[task_id][step_idx] = output_text
 
             gt_actions = step['ground_truth_actions']
             alternative_options = step.get('alternative_options', [])
@@ -967,7 +1201,10 @@ if __name__ == '__main__':
     print(f"Overall Score: {overall_score:.2%}")
     print(f"Average Trajectory Score: {avg_trajectory_score:.2%}")
     print(f"Total Steps Evaluated: {total_steps}")
-    print(f"Alternative Matches: {alternative_matches} ({alternative_matches/total_steps*100:.1f}%)")
+    print(
+        f"Alternative Matches: {alternative_matches} "
+        f"({agentnetbench_metrics['alternative_match_percentage']:.1f}%)"
+    )
     print(f"Milestone Score: {avg_milestone_score:.2%} ({len(milestone_scores)} steps)")
     print("\nAction Type Scores:")
     for action_type, score in sorted(action_type_avg_scores.items()):
@@ -979,6 +1216,11 @@ if __name__ == '__main__':
 
     if args.results_dir:
         os.makedirs(args.results_dir, exist_ok=True)
+
+        runtime_metrics_summary = None
+        if getattr(args, "runtime_metrics", False):
+            RUNTIME_METRICS.mark_run_end()
+            runtime_metrics_summary = collect_runtime_metrics()
 
         peak_alloc_GB = 0.0
         peak_reserved_GB = 0.0
@@ -992,6 +1234,8 @@ if __name__ == '__main__':
             "model_path": args.model_path,
             "kv_cache": args.kv_cache,
             "kv_cache_budget": args.kv_cache_budget,
+            "baseline_gqa_mode": args.baseline_gqa_mode,
+            "opencua_anb_protocol": args.opencua_anb_protocol,
             "attention_implementation": args.attention_implementation,
             "model_dtype": args.model_dtype,
             "max_new_tokens": args.max_new_tokens,
@@ -1015,20 +1259,22 @@ if __name__ == '__main__':
 
         starkv_debug_dump = None
         temporal_debug_dump = None
-        if args.kv_cache == "starkv":
+        if is_starkv_kv(args.kv_cache):
             try:
-                sa0 = model.model.language_model.layers[0].self_attn
+                from attention_helpers import iter_language_model_layers
+                _layers = iter_language_model_layers(model, args.model_path)
+                sa0 = _layers[0].self_attn if _layers else None
+                if sa0 is None:
+                    raise RuntimeError("no language-model layers found for debug dump")
                 mi_ema = getattr(sa0, "kv_group_online_profile_mi_ema", None)
                 if mi_ema is not None and hasattr(mi_ema, "tolist"):
                     mi_ema = mi_ema.tolist()
                 elif isinstance(mi_ema, list):
                     mi_ema = [x.tolist() if hasattr(x, "tolist") else x for x in mi_ema]
                 starkv_debug_dump = {
-                    "selection_mode": str(getattr(sa0, "kv_group_selection_mode", None)),
                     "soft_prior_lambda": float(getattr(sa0, "kv_group_soft_prior_lambda", 0)),
-                    "soft_prior_source": str(getattr(sa0, "kv_group_soft_prior_source", None)),
-                    "online_profile_steps": int(getattr(sa0, "kv_group_online_profile_steps", 0)),
                     "online_profile_step_final": int(getattr(sa0, "kv_group_online_profile_step", 0)),
+                    "online_profile_last_lam_eff": getattr(sa0, "kv_group_online_profile_last_lam_eff", None),
                     "online_profile_mi_ema": mi_ema,
                 }
                 if getattr(args, "kv_group_temporal_enable", False):
@@ -1045,11 +1291,10 @@ if __name__ == '__main__':
             except Exception:
                 pass
 
-        aeb_enabled = bool(getattr(args, "kv_entropy_budget_enable", False)) and args.kv_cache == "starkv"
-        temporal_enabled = bool(getattr(args, "kv_group_temporal_enable", False)) and args.kv_cache == "starkv"
+        temporal_enabled = bool(getattr(args, "kv_group_temporal_enable", False)) and is_starkv_kv(args.kv_cache)
 
         summary = {
-            "method": "starkv" if is_starkv_kv(args.kv_cache) else "original",
+            "method": args.kv_cache,
             "kv_cache": args.kv_cache,
             "budget": args.kv_cache_budget,
             "performance": {
@@ -1060,24 +1305,26 @@ if __name__ == '__main__':
             },
             "efficiency": {
                 "duration_s": duration_s,
+                "steps_per_s_e2e": (
+                    total_steps / duration_s if duration_s > 0 else None
+                ),
                 "peak_alloc_GB": peak_alloc_GB,
                 "peak_reserved_GB": peak_reserved_GB,
                 "gpu_memory_stats": collect_gpu_memory_stats(),
                 "kv_cache_stats": compute_kv_cache_memory_summary(collect_kv_cache_stats()),
+                "runtime_metrics": runtime_metrics_summary,
             },
             "runtime": {
                 "kv_cache": args.kv_cache,
                 "budget": args.kv_cache_budget,
+                "baseline_gqa_mode": args.baseline_gqa_mode,
+                "opencua_anb_protocol": args.opencua_anb_protocol,
                 "temporal_enabled": temporal_enabled,
-                "aeb_enabled": aeb_enabled,
-                "kv_group_selection_mode": getattr(args, "kv_group_selection_mode", None),
                 "kv_group_soft_prior_lambda": getattr(args, "kv_group_soft_prior_lambda", None),
-                "kv_group_soft_prior_source": getattr(args, "kv_group_soft_prior_source", None),
-                "kv_group_online_profile_steps": getattr(args, "kv_group_online_profile_steps", None),
+                "kv_group_online_profile_decay": getattr(args, "kv_group_online_profile_decay", None),
+                "kv_group_online_profile_tau": getattr(args, "kv_group_online_profile_tau", None),
                 "kv_group_temporal_rho": getattr(args, "kv_group_temporal_rho", None),
                 "kv_group_temporal_delta": getattr(args, "kv_group_temporal_delta", None),
-                "kv_entropy_budget_min_scale": getattr(args, "kv_entropy_budget_min_scale", None),
-                "kv_entropy_budget_max_scale": getattr(args, "kv_entropy_budget_max_scale", None),
                 "attention_implementation": args.attention_implementation,
                 "model_dtype": args.model_dtype,
                 "max_new_tokens": args.max_new_tokens,
@@ -1086,7 +1333,6 @@ if __name__ == '__main__':
             "debug": {
                 "starkv_debug": starkv_debug_dump,
                 "temporal_debug": temporal_debug_dump,
-                "entropy_budget_debug": collect_entropy_budget_stats(model, args),
             },
         }
         summary_path = os.path.join(args.results_dir, "summary_results.json")
@@ -1101,5 +1347,5 @@ if __name__ == '__main__':
         print(f"duration_s: {duration_s:.1f}")
         print(f"peak_alloc_GB: {peak_alloc_GB:.2f}")
         print(f"peak_reserved_GB: {peak_reserved_GB:.2f}")
-        print(f"temporal_enabled: {temporal_enabled} | aeb_enabled: {aeb_enabled}")
+        print(f"temporal_enabled: {temporal_enabled}")
         print(f"summary_json_path: {os.path.abspath(summary_path)}")
